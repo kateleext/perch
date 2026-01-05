@@ -11,7 +11,7 @@ func main() {
 	// TODO: Start file watcher
 	// TODO: Run TUI loop
 
-	fmt.Println("drift - passive file monitor")
-	fmt.Println("run ./poc/drift.sh for proof of concept")
+	fmt.Println("perch - passive file monitor")
+	fmt.Println("run ./poc/perch.sh for proof of concept")
 	os.Exit(0)
 }

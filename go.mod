@@ -1,4 +1,4 @@
-module github.com/takumahq/drift
+module github.com/takumahq/perch
 
 go 1.21
 

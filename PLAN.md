@@ -5,7 +5,7 @@
 Validate the concept with bash before writing Go.
 
 ```bash
-./poc/drift.sh
+./poc/perch.sh
 ```
 
 **Validates:**
@@ -35,7 +35,7 @@ internal/
   highlight/
     highlight.go  # chroma syntax highlighting
 
-cmd/drift/
+cmd/perch/
   main.go         # entry point
 ```
 

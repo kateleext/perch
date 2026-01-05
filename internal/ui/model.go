@@ -2,7 +2,7 @@ package ui
 
 import (
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/takumahq/drift/internal/git"
+	"github.com/takumahq/perch/internal/git"
 )
 
 // Layout determines pane arrangement
@@ -62,5 +62,5 @@ func (m Model) View() string {
 	// TODO: render file list
 	// TODO: render preview pane
 	// TODO: apply layout
-	return "drift"
+	return "perch"
 }

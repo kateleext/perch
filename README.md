@@ -1,11 +1,11 @@
-# Drift
+# Perch
 
-Passive file monitor for coding sessions. See what's changing.
+Passive file monitor for coding sessions. See what's changing from above.
 
 ## Install
 
 ```bash
-go install github.com/takumahq/drift@latest
+go install github.com/takumahq/perch@latest
 ```
 
 Or build from source:
@@ -18,13 +18,13 @@ make build
 
 ```bash
 # Watch current directory
-drift
+perch
 
 # Watch specific directory
-drift /path/to/project
+perch /path/to/project
 
 # Vertical layout
-drift -v
+perch -v
 ```
 
 ## Proof of Concept
@@ -32,5 +32,5 @@ drift -v
 Before building the full TUI, validate the concept works:
 
 ```bash
-./poc/drift.sh
+./poc/perch.sh
 ```

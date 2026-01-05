@@ -1,5 +1,5 @@
 #!/bin/bash
-# Drift POC - Proof of concept before building the full TUI
+# Perch POC - Proof of concept before building the full TUI
 # Validates: file watching, git integration, syntax highlighting
 #
 # Dependencies: fswatch, bat
@@ -30,7 +30,7 @@ render() {
     clear
 
     # Header
-    echo -e "${DIM}─── drift ───${RESET}"
+    echo -e "${DIM}─── perch ───${RESET}"
     echo ""
 
     # File list

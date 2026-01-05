@@ -1,16 +1,16 @@
 .PHONY: build run poc clean
 
 build:
-	go build -o drift ./cmd/drift
+	go build -o perch ./cmd/perch
 
 run:
-	go run ./cmd/drift
+	go run ./cmd/perch
 
 poc:
-	./poc/drift.sh
+	./poc/perch.sh
 
 clean:
-	rm -f drift
+	rm -f perch
 
 install:
-	go install ./cmd/drift
+	go install ./cmd/perch
