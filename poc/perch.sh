@@ -31,12 +31,15 @@ trap cleanup EXIT INT TERM
 load_files() {
     FILES=()
 
-    # Uncommitted items first (○ prefix)
+    # Uncommitted files first (○ prefix)
+    # -uall expands untracked directories into individual files
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         local file="${line:3}"
+        # Skip directories, only show files
+        [[ -d "$file" ]] && continue
         FILES+=("uncommitted|$file||")
-    done < <(git status --porcelain 2>/dev/null)
+    done < <(git status --porcelain -uall 2>/dev/null)
 
     # Recently committed files (✓ prefix) - last 5 commits
     while IFS= read -r line; do
@@ -46,6 +49,10 @@ load_files() {
         local time="${rest%% *}"
         local file="${rest#* }"
 
+        # Skip directories
+        [[ -d "$file" ]] && continue
+        # Skip if file no longer exists
+        [[ ! -f "$file" ]] && continue
         # Skip if already in uncommitted
         local exists=0
         for f in "${FILES[@]}"; do
@@ -122,20 +129,11 @@ render() {
     echo -e "${DIM}${line}${RESET}"
     echo ""
 
-    # Preview selected item
+    # Preview selected file
     if [[ ${#FILES[@]} -gt 0 ]]; then
         IFS='|' read -r status file commit time <<< "${FILES[$SELECTED]}"
 
-        if [[ -d "$file" ]]; then
-            # Directory or submodule
-            local basename="${file##*/}"
-            echo -e "${CYAN}${basename}${RESET}  ${DIM}directory${RESET}"
-            echo ""
-            echo -e "${DIM}contains:${RESET}"
-            ls -1 "$file" 2>/dev/null | head -$((preview_lines - 3)) | while read item; do
-                echo -e "  ${DIM}$item${RESET}"
-            done
-        elif [[ -n "$file" && -f "$file" ]]; then
+        if [[ -n "$file" && -f "$file" ]]; then
             # File header with context
             local context="has changes"
             [[ "$status" == "committed" ]] && context="${time} · ${commit}"
@@ -196,7 +194,7 @@ clear
 
 # Initial load
 load_files
-LAST_STATUS=$(git status --porcelain 2>/dev/null; git log --oneline -n 1 2>/dev/null)
+LAST_STATUS=$(git status --porcelain -uall 2>/dev/null; git log --oneline -n 1 2>/dev/null)
 render
 
 # Main loop
@@ -219,7 +217,7 @@ while true; do
         esac
     else
         # Only check for file changes on timeout (every 2 sec)
-        current=$(git status --porcelain 2>/dev/null; git log --oneline -n 1 2>/dev/null)
+        current=$(git status --porcelain -uall 2>/dev/null; git log --oneline -n 1 2>/dev/null)
         if [[ "$current" != "$LAST_STATUS" ]]; then
             LAST_STATUS="$current"
             load_files
