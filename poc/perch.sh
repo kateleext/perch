@@ -31,11 +31,11 @@ trap cleanup EXIT INT TERM
 load_files() {
     FILES=()
 
-    # Uncommitted files first (── prefix)
+    # Uncommitted files first (○ prefix) - only actual files, not directories/submodules
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         local file="${line:3}"
-        FILES+=("uncommitted|$file||")
+        [[ -f "$file" ]] && FILES+=("uncommitted|$file||")
     done < <(git status --porcelain 2>/dev/null)
 
     # Recently committed files (✓ prefix) - last 5 commits
@@ -46,7 +46,8 @@ load_files() {
         local time="${rest%% *}"
         local file="${rest#* }"
 
-        # Skip if already in uncommitted
+        # Skip if already in uncommitted or not a file
+        [[ ! -f "$file" ]] && continue
         local exists=0
         for f in "${FILES[@]}"; do
             [[ "$f" == *"|$file|"* ]] && exists=1 && break
@@ -66,6 +67,11 @@ load_files() {
 render() {
     tput cup 0 0
     tput ed
+
+    # Get terminal width
+    local cols=$(tput cols)
+    local fog_width=$((cols - 4))
+    local line_width=$((cols - 2))
 
     # Header
     echo -e "${DIM}✦${RESET} perch"
@@ -97,7 +103,12 @@ render() {
 
         if [[ $i -eq $SELECTED ]]; then
             prefix="${CYAN}›${RESET} "
-            echo -e "${prefix}${icon} ${file} ${DIM}─────────────────────────${RESET}"
+            local file_len=${#file}
+            local trail_len=$((cols - file_len - 8))
+            (( trail_len < 3 )) && trail_len=3
+            local trail=""
+            for ((t=0; t<trail_len; t++)); do trail+="─"; done
+            echo -e "${prefix}${icon} ${file} ${DIM}${trail}${RESET}"
         else
             echo -e "${prefix}${DIM}${icon}${RESET} ${file}"
         fi
@@ -107,7 +118,10 @@ render() {
     (( end < total )) && echo -e "  ${DIM}↓${RESET}"
 
     echo ""
-    echo -e "${DIM}·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·${RESET}"
+    # Responsive fog divider
+    local fog=""
+    for ((f=0; f<fog_width/4; f++)); do fog+="·  "; done
+    echo -e "${DIM}${fog}${RESET}"
     echo ""
 
     # Preview selected file
@@ -159,7 +173,10 @@ render() {
     fi
 
     echo ""
-    echo -e "${DIM}─────────────────────────────────────────────────────────────${RESET}"
+    # Responsive bottom line
+    local line=""
+    for ((l=0; l<line_width; l++)); do line+="─"; done
+    echo -e "${DIM}${line}${RESET}"
     echo -e "${DIM}↑↓ browse files · j k scroll preview · g top · q quit${RESET}"
 }
 
