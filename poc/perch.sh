@@ -22,8 +22,7 @@ CYAN='\033[38;5;109m'
 RESET='\033[0m'
 
 cleanup() {
-    tput cnorm
-    stty echo
+    tput cnorm  # Show cursor
     exit 0
 }
 trap cleanup EXIT INT TERM
@@ -117,6 +116,12 @@ render() {
 
     (( end < total )) && echo -e "  ${DIM}↓${RESET}"
 
+    # Empty state
+    if (( total == 0 )); then
+        echo -e "  ${DIM}no files changed${RESET}"
+        echo -e "  ${DIM}(submodules and directories are filtered out)${RESET}"
+    fi
+
     echo ""
     # Responsive fog divider
     local fog=""
@@ -181,8 +186,7 @@ render() {
 }
 
 # Setup terminal
-tput civis
-stty -echo
+tput civis  # Hide cursor
 
 # Initial load
 load_files
