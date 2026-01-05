@@ -30,13 +30,12 @@ trap cleanup EXIT INT TERM
 load_files() {
     FILES=()
 
-    # Uncommitted files first (○ prefix) - only actual files, not directories/submodules
-    # -uall expands untracked directories to show individual files
+    # Uncommitted items first (○ prefix)
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         local file="${line:3}"
-        [[ -f "$file" ]] && FILES+=("uncommitted|$file||")
-    done < <(git status --porcelain -uall 2>/dev/null)
+        FILES+=("uncommitted|$file||")
+    done < <(git status --porcelain 2>/dev/null)
 
     # Recently committed files (✓ prefix) - last 5 commits
     while IFS= read -r line; do
@@ -46,8 +45,7 @@ load_files() {
         local time="${rest%% *}"
         local file="${rest#* }"
 
-        # Skip if already in uncommitted or not a file
-        [[ ! -f "$file" ]] && continue
+        # Skip if already in uncommitted
         local exists=0
         for f in "${FILES[@]}"; do
             [[ "$f" == *"|$file|"* ]] && exists=1 && break
@@ -119,8 +117,7 @@ render() {
 
     # Empty state
     if (( total == 0 )); then
-        echo -e "  ${DIM}no files changed${RESET}"
-        echo -e "  ${DIM}(submodules and directories are filtered out)${RESET}"
+        echo -e "  ${DIM}no changes${RESET}"
     fi
 
     echo ""
@@ -130,11 +127,20 @@ render() {
     echo -e "${DIM}${fog}${RESET}"
     echo ""
 
-    # Preview selected file
+    # Preview selected item
     if [[ ${#FILES[@]} -gt 0 ]]; then
         IFS='|' read -r status file commit time <<< "${FILES[$SELECTED]}"
 
-        if [[ -n "$file" && -f "$file" ]]; then
+        if [[ -d "$file" ]]; then
+            # Directory or submodule
+            local basename="${file##*/}"
+            echo -e "${basename}  ${DIM}directory${RESET}"
+            echo ""
+            echo -e "${DIM}contains:${RESET}"
+            ls -1 "$file" 2>/dev/null | head -10 | while read item; do
+                echo -e "  ${DIM}$item${RESET}"
+            done
+        elif [[ -n "$file" && -f "$file" ]]; then
             # File header with context
             local context="has changes"
             [[ "$status" == "committed" ]] && context="${time} · ${commit}"
