@@ -12,16 +12,17 @@ cd "$DIR"
 # State
 SELECTED=0
 SCROLL_OFFSET=0
-FILES=()        # Array of "status|file|commit|time"
+FILES=()
 PAGE_SIZE=8
+LAST_STATUS=""
 
 # Colors (muted, zen palette)
 DIM='\033[2m'
-GREEN='\033[38;5;108m'
 CYAN='\033[38;5;109m'
 RESET='\033[0m'
 
 cleanup() {
+    tput rmcup  # Exit alternate screen
     tput cnorm  # Show cursor
     exit 0
 }
@@ -64,12 +65,12 @@ load_files() {
 
 render() {
     tput cup 0 0
-    tput ed
 
-    # Get terminal width
+    # Get terminal dimensions
     local cols=$(tput cols)
-    local fog_width=$((cols - 4))
-    local line_width=$((cols - 2))
+    local rows=$(tput lines)
+    local preview_lines=$((rows - PAGE_SIZE - 10))
+    (( preview_lines < 5 )) && preview_lines=5
 
     # Header
     echo -e "${DIM}✦${RESET} perch"
@@ -95,20 +96,14 @@ render() {
     while (( i < end )); do
         IFS='|' read -r status file commit time <<< "${FILES[$i]}"
 
-        local prefix="  "
         local icon="✓ "
         [[ "$status" == "uncommitted" ]] && icon="○ "
 
         if [[ $i -eq $SELECTED ]]; then
-            prefix="${CYAN}›${RESET} "
-            local file_len=${#file}
-            local trail_len=$((cols - file_len - 8))
-            (( trail_len < 3 )) && trail_len=3
-            local trail=""
-            for ((t=0; t<trail_len; t++)); do trail+="─"; done
-            echo -e "${prefix}${icon} ${file} ${DIM}${trail}${RESET}"
+            # Selected: cyan arrow and filename
+            echo -e "${CYAN}› ${icon}${file}${RESET}"
         else
-            echo -e "${prefix}${DIM}${icon}${RESET} ${file}"
+            echo -e "  ${DIM}${icon}${RESET}${file}"
         fi
         ((i++))
     done
@@ -121,10 +116,10 @@ render() {
     fi
 
     echo ""
-    # Responsive fog divider
-    local fog=""
-    for ((f=0; f<fog_width/4; f++)); do fog+="·  "; done
-    echo -e "${DIM}${fog}${RESET}"
+    # Solid line divider
+    local line=""
+    for ((l=0; l<cols-2; l++)); do line+="─"; done
+    echo -e "${DIM}${line}${RESET}"
     echo ""
 
     # Preview selected item
@@ -134,10 +129,10 @@ render() {
         if [[ -d "$file" ]]; then
             # Directory or submodule
             local basename="${file##*/}"
-            echo -e "${basename}  ${DIM}directory${RESET}"
+            echo -e "${CYAN}${basename}${RESET}  ${DIM}directory${RESET}"
             echo ""
             echo -e "${DIM}contains:${RESET}"
-            ls -1 "$file" 2>/dev/null | head -10 | while read item; do
+            ls -1 "$file" 2>/dev/null | head -$((preview_lines - 3)) | while read item; do
                 echo -e "  ${DIM}$item${RESET}"
             done
         elif [[ -n "$file" && -f "$file" ]]; then
@@ -146,7 +141,7 @@ render() {
             [[ "$status" == "committed" ]] && context="${time} · ${commit}"
 
             local basename="${file##*/}"
-            echo -e "${basename}  ${DIM}${context}${RESET}"
+            echo -e "${CYAN}${basename}${RESET}  ${DIM}${context}${RESET}"
             echo ""
 
             # Smart preview - no line numbers for prose files
@@ -160,62 +155,54 @@ render() {
                     ;;
             esac
 
-            # Show with diff if uncommitted
+            # Show file content
+            local start_line=$((SCROLL_OFFSET + 1))
+            local end_line=$((SCROLL_OFFSET + preview_lines))
+
             if [[ "$status" == "uncommitted" ]]; then
-                bat $style_opts --color=always --theme="Nord" --diff --paging=never --line-range=$((SCROLL_OFFSET+1)):$((SCROLL_OFFSET+25)) "$file" 2>/dev/null || cat "$file" | head -25
+                bat $style_opts --color=always --theme="Nord" --diff --paging=never --line-range=${start_line}:${end_line} "$file" 2>/dev/null || head -n $end_line "$file" | tail -n +$start_line
             else
-                bat $style_opts --color=always --theme="Nord" --paging=never --line-range=$((SCROLL_OFFSET+1)):$((SCROLL_OFFSET+25)) "$file" 2>/dev/null || cat "$file" | head -25
+                bat $style_opts --color=always --theme="Nord" --paging=never --line-range=${start_line}:${end_line} "$file" 2>/dev/null || head -n $end_line "$file" | tail -n +$start_line
             fi
 
             # Show scroll indicator
-            local line_count=$(wc -l < "$file" 2>/dev/null || echo 0)
-            if (( line_count > 25 )); then
-                local percent=$(( (SCROLL_OFFSET * 100) / (line_count - 25) ))
-                (( percent > 100 )) && percent=100
-                (( percent < 0 )) && percent=0
+            local line_count=$(wc -l < "$file" 2>/dev/null | tr -d ' ')
+            line_count=${line_count:-0}
+            if (( line_count > preview_lines )); then
                 if (( SCROLL_OFFSET == 0 )); then
                     echo -e "${DIM}top of file${RESET}"
-                elif (( SCROLL_OFFSET >= line_count - 25 )); then
+                elif (( SCROLL_OFFSET >= line_count - preview_lines )); then
                     echo -e "${DIM}end of file${RESET}"
                 else
-                    echo -e "${DIM}scrolling ↓ ${percent}%${RESET}"
+                    local percent=$(( (SCROLL_OFFSET * 100) / (line_count - preview_lines) ))
+                    echo -e "${DIM}${percent}% ↓${RESET}"
                 fi
             fi
         fi
     fi
 
+    # Clear rest of screen
+    tput ed
+
+    # Bottom bar
     echo ""
-    # Responsive bottom line
-    local line=""
-    for ((l=0; l<line_width; l++)); do line+="─"; done
-    echo -e "${DIM}${line}${RESET}"
-    echo -e "${DIM}↑↓ browse files · j k scroll preview · g top · q quit${RESET}"
+    echo -e "${DIM}↑↓ browse · j k scroll · g top · q quit${RESET}"
 }
 
 # Setup terminal
+tput smcup  # Enter alternate screen
 tput civis  # Hide cursor
+clear
 
 # Initial load
 load_files
+LAST_STATUS=$(git status --porcelain 2>/dev/null; git log --oneline -n 1 2>/dev/null)
 render
-
-# Track changes
-LAST_STATUS=""
-check_changes() {
-    local current
-    current=$(git status --porcelain 2>/dev/null; git log --oneline -n 1 2>/dev/null)
-    if [[ "$current" != "$LAST_STATUS" ]]; then
-        LAST_STATUS="$current"
-        load_files
-        render
-    fi
-}
 
 # Main loop
 while true; do
-    check_changes
-
-    if read -rsn1 -t 1 key; then
+    # Check for changes less frequently (only after key timeout)
+    if read -rsn1 -t 2 key; then
         case "$key" in
             q) exit 0 ;;
             g) SELECTED=0; SCROLL_OFFSET=0; render ;;
@@ -230,5 +217,13 @@ while true; do
                 esac
                 ;;
         esac
+    else
+        # Only check for file changes on timeout (every 2 sec)
+        current=$(git status --porcelain 2>/dev/null; git log --oneline -n 1 2>/dev/null)
+        if [[ "$current" != "$LAST_STATUS" ]]; then
+            LAST_STATUS="$current"
+            load_files
+            render
+        fi
     fi
 done
