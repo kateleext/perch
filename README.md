@@ -1,6 +1,8 @@
 # Perch
 
-Passive file monitor for coding sessions. See what's changing from above.
+Passive file monitor for coding sessions. Watch what's changing from above.
+
+> The bird's eye view of your work.
 
 ## Install
 
