@@ -3,15 +3,27 @@ package main
 import (
 	"fmt"
 	"os"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/kateleext/perch/internal/ui"
 )
 
 func main() {
-	// TODO: Parse args (directory, layout)
-	// TODO: Initialize bubbletea program
-	// TODO: Start file watcher
-	// TODO: Run TUI loop
+	// Get directory from args or use current
+	dir := "."
+	if len(os.Args) > 1 {
+		dir = os.Args[1]
+	}
 
-	fmt.Println("perch - passive file monitor")
-	fmt.Println("run ./poc/perch.sh for proof of concept")
-	os.Exit(0)
+	// Create and run the TUI
+	p := tea.NewProgram(
+		ui.New(dir),
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+	)
+
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
 }
