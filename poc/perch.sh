@@ -31,11 +31,12 @@ load_files() {
     FILES=()
 
     # Uncommitted files first (○ prefix) - only actual files, not directories/submodules
+    # -uall expands untracked directories to show individual files
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         local file="${line:3}"
         [[ -f "$file" ]] && FILES+=("uncommitted|$file||")
-    done < <(git status --porcelain 2>/dev/null)
+    done < <(git status --porcelain -uall 2>/dev/null)
 
     # Recently committed files (✓ prefix) - last 5 commits
     while IFS= read -r line; do
