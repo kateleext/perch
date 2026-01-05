@@ -1,0 +1,45 @@
+version: 2
+
+project_name: perch
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./cmd/perch
+    binary: perch
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+
+brews:
+  - repository:
+      owner: kateleext
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/kateleext/perch"
+    description: "Passive file monitor for coding sessions"
+    license: "MIT"
+    install: |
+      bin.install "perch"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
