@@ -14,7 +14,7 @@ import (
 // gitCmd creates a git command with --no-optional-locks to avoid lock contention
 func gitCmd(args ...string) *exec.Cmd {
 	fullArgs := append([]string{"--no-optional-locks"}, args...)
-	return gitCmd(fullArgs...)
+	return exec.Command("git", fullArgs...)
 }
 
 // FileStatus represents a file's git status
