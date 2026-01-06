@@ -12,7 +12,6 @@ import (
 	"github.com/alecthomas/chroma/v2/formatters"
 	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/alecthomas/chroma/v2/styles"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/kateleext/perch/internal/git"
@@ -40,20 +39,21 @@ type Model struct {
 	files          []git.FileStatus
 	selected       int
 	listScroll     int
+	previewScroll  int            // manual scroll position for preview content
 	dir            string
 	gitRoot        string
 	width          int
 	height         int
 	listHeight     int
-	viewport       viewport.Model
 	previewReady   bool
 	dragging       bool
 	dividerY       int
 	diffLines      map[int]string   // line number -> "added" or "deleted"
 	diffStats      git.DiffStats
-	highlightLines []string         // syntax highlighted lines (raw content for diff lines)
+	highlightLines []string         // syntax highlighted lines
 	rawLines       []string         // original unhighlighted lines
 	sparkleOn      bool             // sparkle animation state
+	previewMsg     string           // message to show in preview (for deleted/unsupported files)
 }
 
 // New creates a new UI model
@@ -92,8 +92,6 @@ type filesLoadedMsg struct {
 
 // Update implements tea.Model
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
-
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -110,7 +108,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.listScroll = 0
 					}
 				}
-				m.viewport.GotoTop()
+				m.previewScroll = 0
 				m.updatePreview()
 			}
 		case "down":
@@ -129,19 +127,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.selected >= m.listScroll+visibleCapacity-bottomBuffer {
 					m.listScroll = m.selected - visibleCapacity + bottomBuffer + 1
 				}
-				m.viewport.GotoTop()
+				m.previewScroll = 0
 				m.updatePreview()
 			}
 		case "j":
-			m.viewport, cmd = m.viewport.Update(tea.KeyMsg{Type: tea.KeyDown})
-			return m, cmd
+			m.previewScroll++
 		case "k":
-			m.viewport, cmd = m.viewport.Update(tea.KeyMsg{Type: tea.KeyUp})
-			return m, cmd
+			if m.previewScroll > 0 {
+				m.previewScroll--
+			}
 		case "g":
-			m.viewport.GotoTop()
+			m.previewScroll = 0
 		case "G":
-			m.viewport.GotoBottom()
+			// Scroll to bottom - calculate max scroll
+			if len(m.highlightLines) > 0 {
+				previewHeight := m.height - m.listHeight - 4
+				if previewHeight < 1 {
+					previewHeight = 1
+				}
+				m.previewScroll = len(m.highlightLines) - previewHeight
+				if m.previewScroll < 0 {
+					m.previewScroll = 0
+				}
+			}
 		case "+", "=":
 			if m.listHeight < m.height-10 {
 				m.listHeight++
@@ -158,13 +166,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Type {
 		case tea.MouseWheelUp:
 			if msg.Y > m.dividerY {
-				m.viewport, cmd = m.viewport.Update(tea.KeyMsg{Type: tea.KeyUp})
-				return m, cmd
+				if m.previewScroll > 0 {
+					m.previewScroll--
+				}
 			}
 		case tea.MouseWheelDown:
 			if msg.Y > m.dividerY {
-				m.viewport, cmd = m.viewport.Update(tea.KeyMsg{Type: tea.KeyDown})
-				return m, cmd
+				m.previewScroll++
 			}
 		case tea.MouseLeft:
 			if msg.Y >= m.dividerY-1 && msg.Y <= m.dividerY+1 {
@@ -216,13 +224,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) recalculateViewport() {
 	// Layout: list + divider(1) + previewHeader(1) + underline(1) + preview + footer(1)
-	previewHeight := m.height - m.listHeight - 4
-	if previewHeight < 3 {
-		previewHeight = 3
-	}
-
-	m.viewport = viewport.New(m.width-8, previewHeight) // -8 for line numbers + gutter + padding
-	m.viewport.Style = lipgloss.NewStyle()
 	m.dividerY = m.listHeight
 	m.previewReady = true
 	m.updatePreview()
@@ -240,7 +241,10 @@ func (m *Model) updatePreview() {
 	if strings.Contains(file.GitCode, "D") {
 		m.diffLines = make(map[int]string)
 		m.diffStats = git.DiffStats{}
-		m.viewport.SetContent(fmt.Sprintf("\n\n  %s was deleted", file.Path))
+		m.rawLines = nil
+		m.highlightLines = nil
+		m.previewMsg = fmt.Sprintf("%s was deleted", file.Path)
+		m.previewScroll = 0
 		return
 	}
 
@@ -248,9 +252,19 @@ func (m *Model) updatePreview() {
 	if isUnsupportedFile(file.Path) {
 		m.diffLines = make(map[int]string)
 		m.diffStats = git.DiffStats{}
-		m.viewport.SetContent(fmt.Sprintf("\n\n  %s was updated, but isn't supported in perch", file.Path))
+		m.rawLines = nil
+		m.highlightLines = nil
+		reason := "not supported in perch"
+		if filepath.Ext(file.Path) == "" {
+			reason = "no file extension — open in your editor"
+		}
+		m.previewMsg = fmt.Sprintf("%s\n%s", filepath.Base(file.Path), reason)
+		m.previewScroll = 0
 		return
 	}
+
+	// Clear message for normal files
+	m.previewMsg = ""
 
 	// Get diff info for uncommitted files (use file's GitRoot for git commands)
 	if file.Status == "uncommitted" {
@@ -268,9 +282,10 @@ func (m *Model) updatePreview() {
 	// Read file content
 	content, err := os.ReadFile(fullPath)
 	if err != nil {
-		m.viewport.SetContent(fmt.Sprintf("\n\n  couldn't read %s", file.Path))
 		m.rawLines = nil
 		m.highlightLines = nil
+		m.previewMsg = fmt.Sprintf("couldn't read %s", file.Path)
+		m.previewScroll = 0
 		return
 	}
 
@@ -280,12 +295,20 @@ func (m *Model) updatePreview() {
 	// Syntax highlight the content
 	m.highlightLines = highlightCode(string(content), file.Path)
 
-	// Set viewport content (we'll render with highlighting in View)
-	m.viewport.SetContent(string(content))
+	// Reset scroll to top when viewing new file
+	m.previewScroll = 0
 }
 
 // highlightCode returns syntax-highlighted lines for the given content
 func highlightCode(content, filename string) []string {
+	lines := strings.Split(content, "\n")
+	
+	// Skip highlighting for Go files - they have rendering issues with Chroma's formatter
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext == ".go" {
+		return lines
+	}
+	
 	// Get lexer for file type
 	lexer := lexers.Match(filename)
 
@@ -297,8 +320,9 @@ func highlightCode(content, filename string) []string {
 		}
 	}
 
+	// If no lexer found, return plaintext (don't use Fallback which produces broken ANSI)
 	if lexer == nil {
-		lexer = lexers.Fallback
+		return lines
 	}
 	lexer = chroma.Coalesce(lexer)
 
@@ -314,24 +338,39 @@ func highlightCode(content, filename string) []string {
 		formatter = formatters.Fallback
 	}
 
-	// Tokenize and format
-	iterator, err := lexer.Tokenise(nil, content)
-	if err != nil {
-		return strings.Split(content, "\n")
+	// Highlight each line independently to avoid ANSI sequence corruption
+	highlightedLines := make([]string, len(lines))
+	for i, line := range lines {
+		iterator, err := lexer.Tokenise(nil, line)
+		if err != nil {
+			highlightedLines[i] = line
+			continue
+		}
+
+		var buf bytes.Buffer
+		err = formatter.Format(&buf, style, iterator)
+		if err != nil {
+			highlightedLines[i] = line
+			continue
+		}
+
+		// Trim trailing newline from formatter output
+		highlighted := strings.TrimSuffix(buf.String(), "\n")
+		highlightedLines[i] = highlighted
 	}
 
-	var buf bytes.Buffer
-	err = formatter.Format(&buf, style, iterator)
-	if err != nil {
-		return strings.Split(content, "\n")
-	}
-
-	return strings.Split(buf.String(), "\n")
+	return highlightedLines
 }
 
 // isUnsupportedFile returns true for binary/non-text files
 func isUnsupportedFile(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
+	
+	// Files with no extension
+	if ext == "" {
+		return true
+	}
+	
 	unsupported := map[string]bool{
 		// Xcode
 		".xcuserstate": true, ".xcworkspace": true, ".pbxproj": true,
@@ -362,6 +401,11 @@ func isUnsupportedFile(path string) bool {
 func (m Model) View() string {
 	var b strings.Builder
 
+	// SAFETY: ensure we never render invalid state
+	if m.height <= 0 {
+		return ""
+	}
+
 	// Top padding
 	b.WriteString("\n")
 
@@ -374,7 +418,10 @@ func (m Model) View() string {
 	} else {
 		sparkle = dimStyle.Render("✦")
 	}
-	if len(m.files) == 0 {
+	hasFiles := len(m.files) > 0
+	selectedValid := m.selected >= 0 && m.selected < len(m.files)
+
+	if !hasFiles {
 		// Empty state - centered message
 		header := " " + sparkle + dimStyle.Render(" perched on "+shortPath)
 		hint := keyStyle.Render("↑↓") + dimStyle.Render(" browse")
@@ -413,7 +460,10 @@ func (m Model) View() string {
 		quitHint := keyStyle.Render("q") + dimStyle.Render(" quit")
 		b.WriteString(m.padRight("", quitHint))
 		return b.String()
-	} else {
+	}
+
+	// File list section
+	if hasFiles {
 		// Calculate how many file lines we can actually show
 		showUpArrow := m.listScroll > 0
 
@@ -452,6 +502,11 @@ func (m Model) View() string {
 		}
 
 		for i := visibleStart; i < visibleEnd; i++ {
+			// Bounds check
+			if i < 0 || i >= len(m.files) {
+				break
+			}
+
 			f := m.files[i]
 
 			// Icons: ✦ new, - uncommitted/modified, ✓ committed
@@ -480,21 +535,22 @@ func (m Model) View() string {
 			linesUsed++
 		}
 
+		// Pad to exact listHeight
 		for linesUsed < m.listHeight {
 			b.WriteString("\n")
 			linesUsed++
 		}
 	}
 
-	// Divider
+	// Divider - always written after file list section
 	dividerWidth := m.width
 	if dividerWidth < 1 {
 		dividerWidth = 40
 	}
 	b.WriteString(dividerStyle.Render(strings.Repeat("─", dividerWidth)) + "\n")
 
-	// Preview header with scroll hint and +/- stats
-	if len(m.files) > 0 {
+	// Preview section - only render if we have a valid selected file
+	if selectedValid && m.previewReady {
 		file := m.files[m.selected]
 		basename := filepath.Base(file.Path)
 
@@ -513,6 +569,7 @@ func (m Model) View() string {
 			context = file.ChangeType()
 		}
 
+		// Preview header
 		header := "  " + cyanStyle.Render(basename) + "  " + dimStyle.Render(context)
 		hint := keyStyle.Render("j k") + dimStyle.Render(" scroll  ")
 		b.WriteString(m.padRight(header, hint) + "\n")
@@ -520,10 +577,19 @@ func (m Model) View() string {
 		// Underline below filename (full width, same as top divider)
 		b.WriteString(dividerStyle.Render(strings.Repeat("─", dividerWidth)) + "\n")
 
-		// Preview content with syntax highlighting and diff colors
-		if m.previewReady && len(m.highlightLines) > 0 {
-			startLine := m.viewport.YOffset
-			endLine := startLine + m.viewport.Height
+		// Preview content - either file content or message
+		previewHeight := m.height - m.listHeight - 4
+		if previewHeight < 1 {
+			previewHeight = 1
+		}
+
+		if m.previewMsg != "" {
+			// Show message (deleted, unsupported, etc)
+			b.WriteString("\n  " + dimStyle.Render(m.previewMsg) + "\n")
+		} else if len(m.highlightLines) > 0 {
+			// Show file content with syntax highlighting and diff colors
+			startLine := m.previewScroll
+			endLine := startLine + previewHeight
 			if endLine > len(m.highlightLines) {
 				endLine = len(m.highlightLines)
 			}
@@ -572,8 +638,12 @@ func (m Model) View() string {
 			}
 		}
 	} else {
-		b.WriteString("\n")
-		for i := 0; i < m.viewport.Height; i++ {
+		// No preview to show - fill preview space
+		previewHeight := m.height - m.listHeight - 4
+		if previewHeight < 1 {
+			previewHeight = 1
+		}
+		for i := 0; i < previewHeight; i++ {
 			b.WriteString("\n")
 		}
 	}

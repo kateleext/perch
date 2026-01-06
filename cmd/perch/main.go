@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/kateleext/perch/internal/ui"
@@ -46,15 +45,6 @@ func main() {
 		tea.WithAltScreen(),
 		tea.WithMouseAllMotion(),
 	)
-
-	// Simple polling refresh every 2 seconds
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			p.Send(ui.RefreshMsg{})
-		}
-	}()
 
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v\n", err)
