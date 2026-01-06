@@ -117,12 +117,12 @@ func renderViewClean(snap ViewSnapshot, model Model) string {
 	b.WriteString(dividerStyle.Render(strings.Repeat("─", snap.Width)) + "\n")
 
 	// === PREVIEW SECTION ===
-	if snap.SelectedIdx >= 0 && snap.SelectedIdx < len(snap.Files) {
+	if snap.SelectedIdx >= 0 && snap.SelectedIdx < len(snap.Files) && model.preview.Valid {
 		renderPreviewHeaderClean(&b, snap)
 		b.WriteString(dividerStyle.Render(strings.Repeat("─", snap.Width)) + "\n")
 		renderPreviewContentClean(&b, snap, model, previewSpaceAvailable)
 	} else {
-		// No file selected - fill preview space
+		// No file selected or preview not ready - fill preview space
 		for i := 0; i < previewHeaderHeight+previewUnderlineHeight+previewSpaceAvailable; i++ {
 			b.WriteString("\n")
 		}
