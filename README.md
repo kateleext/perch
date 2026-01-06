@@ -11,7 +11,18 @@ Perch shows the most recent changes in any git directory. Whatever your agent ju
 
 ## Install
 
-**Direct (Recommended):**
+**Homebrew:**
+```
+brew tap kateleext/homebrew-tap
+brew install perch
+```
+
+**Go:**
+```
+go install github.com/kateleext/perch/cmd/perch@latest
+```
+
+**Direct:**
 ```
 # macOS arm64 (Apple Silicon)
 curl -L https://github.com/kateleext/perch/releases/download/v0.0.1/perch_darwin_arm64.tar.gz | tar xz -C /usr/local/bin
@@ -24,17 +35,6 @@ curl -L https://github.com/kateleext/perch/releases/download/v0.0.1/perch_linux_
 
 # Linux x86_64
 curl -L https://github.com/kateleext/perch/releases/download/v0.0.1/perch_linux_amd64.tar.gz | tar xz -C /usr/local/bin
-```
-
-**Go:**
-```
-go install github.com/kateleext/perch/cmd/perch@latest
-```
-
-**Homebrew** (experimental):
-```
-brew tap kateleext/homebrew-tap
-brew install perch
 ```
 
 ## Usage
