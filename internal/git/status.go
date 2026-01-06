@@ -11,6 +11,12 @@ import (
 	"time"
 )
 
+// gitCmd creates a git command with --no-optional-locks to avoid lock contention
+func gitCmd(args ...string) *exec.Cmd {
+	fullArgs := append([]string{"--no-optional-locks"}, args...)
+	return gitCmd(fullArgs...)
+}
+
 // FileStatus represents a file's git status
 type FileStatus struct {
 	Status   string    // "uncommitted" or "committed"
@@ -73,12 +79,12 @@ func shouldSkipFile(path string) bool {
 
 // GetDiffStats returns +/- line counts for a file
 func GetDiffStats(dir, path string) DiffStats {
-	cmd := exec.Command("git", "diff", "--numstat", "--", path)
+	cmd := gitCmd("diff", "--numstat", "--", path)
 	cmd.Dir = dir
 	output, err := cmd.Output()
 	if err != nil {
 		// Try for untracked files - compare to empty
-		cmd = exec.Command("git", "diff", "--numstat", "/dev/null", path)
+		cmd = gitCmd("diff", "--numstat", "/dev/null", path)
 		cmd.Dir = dir
 		output, _ = cmd.Output()
 	}
@@ -102,7 +108,7 @@ func GetDiffLines(dir, path string) map[int]string {
 	result := make(map[int]string)
 
 	// Get unified diff
-	cmd := exec.Command("git", "diff", "-U0", "--", path)
+	cmd := gitCmd("diff", "-U0", "--", path)
 	cmd.Dir = dir
 	output, err := cmd.Output()
 	if err != nil {
@@ -143,7 +149,7 @@ func GetDiffLines(dir, path string) map[int]string {
 
 // GetGitRoot returns the root of the git repository
 func GetGitRoot(dir string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd := gitCmd("rev-parse", "--show-toplevel")
 	cmd.Dir = dir
 	output, err := cmd.Output()
 	if err != nil {
@@ -154,7 +160,7 @@ func GetGitRoot(dir string) (string, error) {
 
 // GetSubmodules returns paths of submodules within a directory
 func GetSubmodules(dir string) []string {
-	cmd := exec.Command("git", "submodule", "status", "--recursive")
+	cmd := gitCmd("submodule", "status", "--recursive")
 	cmd.Dir = dir
 
 	// Capture stdout separately - git may output valid data before hitting errors
@@ -321,7 +327,7 @@ func getNestedRepoFiles(repoPath, targetDir string) ([]FileStatus, error) {
 	var files []FileStatus
 
 	// Get uncommitted files
-	cmd := exec.Command("git", "status", "--porcelain", "-uall")
+	cmd := gitCmd("status", "--porcelain", "-uall")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -364,7 +370,7 @@ func getNestedRepoFiles(repoPath, targetDir string) ([]FileStatus, error) {
 	}
 
 	// Also get recently committed files from nested repo
-	cmd = exec.Command("git", "log", "--name-only", "--pretty=format:%h|%ar", "-n", "5")
+	cmd = gitCmd("log", "--name-only", "--pretty=format:%h|%ar", "-n", "5")
 	cmd.Dir = repoPath
 	output, err = cmd.Output()
 	if err != nil {
@@ -424,7 +430,7 @@ func getNestedRepoFiles(repoPath, targetDir string) ([]FileStatus, error) {
 }
 
 func getUncommitted(gitRoot, prefix, fileGitRoot string) ([]FileStatus, error) {
-	cmd := exec.Command("git", "status", "--porcelain", "-uall")
+	cmd := gitCmd("status", "--porcelain", "-uall")
 	cmd.Dir = gitRoot
 	output, err := cmd.Output()
 	if err != nil {
@@ -481,7 +487,7 @@ func getUncommitted(gitRoot, prefix, fileGitRoot string) ([]FileStatus, error) {
 
 func getRecentlyCommitted(gitRoot, prefix, fileGitRoot string) ([]FileStatus, error) {
 	// Get last 5 commits with files
-	cmd := exec.Command("git", "log", "--name-only", "--pretty=format:%h|%ar", "-n", "5")
+	cmd := gitCmd("log", "--name-only", "--pretty=format:%h|%ar", "-n", "5")
 	cmd.Dir = gitRoot
 	output, err := cmd.Output()
 	if err != nil {
