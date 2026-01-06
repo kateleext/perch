@@ -320,39 +320,43 @@ func renderPreviewContentClean(b *bytes.Buffer, snap ViewSnapshot, model Model, 
 		return
 	}
 
-	// Show file content
-	if len(preview.Lines) > 0 {
+	// Show file content - use raw lines for now to avoid syntax highlighting issues
+	if len(preview.RawLines) > 0 {
 		startLine := snap.PreviewScroll
 		endLine := startLine + contentHeight
 
-		if endLine > len(preview.Lines) {
-			endLine = len(preview.Lines)
+		if endLine > len(preview.RawLines) {
+			endLine = len(preview.RawLines)
+		}
+
+		// Clamp start line to valid range
+		if startLine < 0 {
+			startLine = 0
+		}
+		if startLine >= len(preview.RawLines) {
+			startLine = len(preview.RawLines) - 1
+			if startLine < 0 {
+				startLine = 0
+			}
 		}
 
 		linesRendered := 0
 
-		for i := startLine; i < endLine; i++ {
+		for i := startLine; i < endLine && i < len(preview.RawLines); i++ {
 			lineNum := i + 1 // 1-indexed
 
 			// Get diff status
 			status, isDiff := preview.DiffLines[lineNum]
 
-			var lineContent string
+			// Get the line content - use raw for now
+			lineContent := preview.RawLines[i]
+
+			// Override with diff coloring if this line is a diff
 			if isDiff {
-				// Use raw line with diff coloring
-				rawLine := ""
-				if i < len(preview.RawLines) {
-					rawLine = preview.RawLines[i]
-				}
 				if status == "added" {
-					lineContent = lineAddStyle.Render(rawLine)
+					lineContent = lineAddStyle.Render(lineContent)
 				} else {
-					lineContent = lineDelStyle.Render(rawLine)
-				}
-			} else {
-				// Use highlighted line
-				if i < len(preview.Lines) {
-					lineContent = preview.Lines[i]
+					lineContent = lineDelStyle.Render(lineContent)
 				}
 			}
 
