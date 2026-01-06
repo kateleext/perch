@@ -40,7 +40,11 @@ curl -L https://github.com/kateleext/perch/releases/download/v0.0.1/perch_linux_
 ## Usage
 
 ```
-perch [directory]
+# Run in current directory
+perch
+
+# Watch a specific directory
+perch /path/to/repo
 ```
 
 Run it in a split pane. It refreshes every 2 seconds.
