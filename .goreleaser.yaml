@@ -31,6 +31,7 @@ brews:
     homepage: "https://github.com/kateleext/perch"
     description: "Minimal file viewer for coding agents"
     license: "MIT"
+    dependencies: []
     install: |
       bin.install "perch"
 
