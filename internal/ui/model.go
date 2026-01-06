@@ -47,20 +47,21 @@ type PreviewContent struct {
 
 // Model is the main bubbletea model
 type Model struct {
-	files          []git.FileStatus
-	selected       int
-	listScroll     int
-	previewScroll  int            // manual scroll position for preview content
-	dir            string
-	gitRoot        string
-	width          int
-	height         int
-	listHeight     int
-	previewReady   bool
-	dragging       bool
-	dividerY       int
-	preview        PreviewContent  // immutable content for currently selected file
-	sparkleOn      bool             // sparkle animation state
+	files            []git.FileStatus
+	selected         int
+	lastSelectedFile int            // track which file had preview loaded
+	listScroll       int
+	previewScroll    int            // manual scroll position for preview content
+	dir              string
+	gitRoot          string
+	width            int
+	height           int
+	listHeight       int
+	previewReady     bool
+	dragging         bool
+	dividerY         int
+	preview          PreviewContent  // immutable content for currently selected file
+	sparkleOn        bool             // sparkle animation state
 }
 
 // New creates a new UI model
@@ -239,6 +240,12 @@ func (m *Model) recalculateViewport() {
 func (m *Model) updatePreview() {
 	if !m.previewReady || len(m.files) == 0 {
 		m.preview = PreviewContent{}
+		m.lastSelectedFile = -1
+		return
+	}
+
+	// Skip if we already have this file loaded
+	if m.selected == m.lastSelectedFile && m.preview.Valid {
 		return
 	}
 
@@ -251,6 +258,7 @@ func (m *Model) updatePreview() {
 			Valid:   true,
 			Message: fmt.Sprintf("%s was deleted", file.Path),
 		}
+		m.lastSelectedFile = m.selected
 		m.previewScroll = 0
 		return
 	}
@@ -265,6 +273,7 @@ func (m *Model) updatePreview() {
 			Valid:   true,
 			Message: fmt.Sprintf("%s\n%s", filepath.Base(file.Path), reason),
 		}
+		m.lastSelectedFile = m.selected
 		m.previewScroll = 0
 		return
 	}
@@ -291,6 +300,7 @@ func (m *Model) updatePreview() {
 			Valid:   true,
 			Message: fmt.Sprintf("couldn't read %s", file.Path),
 		}
+		m.lastSelectedFile = m.selected
 		m.previewScroll = 0
 		return
 	}
@@ -310,6 +320,9 @@ func (m *Model) updatePreview() {
 		DiffStats:  diffStats,
 		IsMarkdown: strings.HasSuffix(strings.ToLower(file.Path), ".md"),
 	}
+
+	// Track which file we loaded
+	m.lastSelectedFile = m.selected
 
 	// Reset scroll to top when viewing new file
 	m.previewScroll = 0

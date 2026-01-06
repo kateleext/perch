@@ -322,19 +322,24 @@ func renderPreviewContentClean(b *bytes.Buffer, snap ViewSnapshot, model Model, 
 
 	// Show file content - use raw lines for now to avoid syntax highlighting issues
 	if len(preview.RawLines) > 0 {
+		// Clamp scroll position
 		startLine := snap.PreviewScroll
-		endLine := startLine + contentHeight
-
-		if endLine > len(preview.RawLines) {
-			endLine = len(preview.RawLines)
-		}
-
-		// Clamp start line to valid range
 		if startLine < 0 {
 			startLine = 0
 		}
 		if startLine >= len(preview.RawLines) {
 			startLine = len(preview.RawLines) - 1
+		}
+
+		// Calculate end line
+		endLine := startLine + contentHeight
+		if endLine > len(preview.RawLines) {
+			endLine = len(preview.RawLines)
+		}
+
+		// Safety: ensure we don't render negative or out of order ranges
+		if startLine >= endLine {
+			startLine = endLine - 1
 			if startLine < 0 {
 				startLine = 0
 			}
@@ -342,7 +347,7 @@ func renderPreviewContentClean(b *bytes.Buffer, snap ViewSnapshot, model Model, 
 
 		linesRendered := 0
 
-		for i := startLine; i < endLine && i < len(preview.RawLines); i++ {
+		for i := startLine; i < endLine && i >= 0 && i < len(preview.RawLines); i++ {
 			lineNum := i + 1 // 1-indexed
 
 			// Get diff status
