@@ -2,9 +2,8 @@
 
 **Minimal file viewer that stays perched on your agents' progress.**
 
-Like many, I recently moved to terminal-based coding agents. The only thing I missed from VS Code was the file tree - not to edit,
-but to stay grounded in what the agent was doing. Even without reading every line, seeing which files changed helped me prompt
-better. We'd build a shared vocabulary: this file does X, that function handles Y.
+Like many, I recently moved to the terminal as my primary surface. The only thing I missed from IDEs was the file tree - not to edit,
+but to stay grounded in what the agent was doing. Even without reading every line, seeing which files changed created a shared vocabulary between me and the agents.
 
 But agent TUIs are already information-dense. I needed something minimal. Read-only. Single-purpose.
 
