@@ -7,7 +7,7 @@ but to stay grounded in what the agent was doing. Even without reading every lin
 
 But agent TUIs are already information-dense. I needed something minimal. Read-only. Single-purpose.
 
-Perch shows the most recent changes in any git directory. Whatever your agent just touched appears at the top. File preview with syntax highlighting shows diffs side-by-side, read-only. That's it.
+Perch shows the most recent changes in any git directory. Whatever your agent just touched appears at the top. File preview with syntax highlighting shows diffs inline, read-only. That's it.
 
 ## Install
 
