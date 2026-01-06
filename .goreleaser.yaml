@@ -29,8 +29,10 @@ brews:
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     directory: Formula
     homepage: "https://github.com/kateleext/perch"
-    description: "Passive file monitor for coding sessions"
+    description: "Minimal file viewer for coding agents"
     license: "MIT"
+    test: |
+      system "#{bin}/perch --help" if File.exist?("#{bin}/perch")
     install: |
       bin.install "perch"
 
