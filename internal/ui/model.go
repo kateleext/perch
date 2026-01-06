@@ -36,11 +36,12 @@ type TickMsg time.Time
 
 // PreviewContent holds the rendered preview data for a specific file
 type PreviewContent struct {
-	Valid     bool
-	Message   string
-	RawLines  []string
-	DiffLines map[int]string
-	DiffStats git.DiffStats
+	Valid           bool
+	Message         string
+	RawLines        []string
+	HighlightedLines []string
+	DiffLines       map[int]string
+	DiffStats       git.DiffStats
 }
 
 // Model is the main bubbletea model
@@ -178,6 +179,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case filesLoadedMsg:
 		m.loading = false
 		
+		// Remember if we were at the top file
+		wasAtTop := m.selected == 0
+		
 		// Remember currently selected file path to preserve selection
 		var selectedPath string
 		if m.selected >= 0 && m.selected < len(m.files) {
@@ -186,12 +190,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		
 		m.files = msg.files
 		
-		// Try to keep selection on the same file
+		// If we were at top, stay at top (auto-select newest)
+		// Otherwise, try to keep selection on the same file
 		newSelected := 0
-		for i, f := range m.files {
-			if f.Path == selectedPath {
-				newSelected = i
-				break
+		sameFile := false
+		if wasAtTop {
+			// Stay at top - auto-select newest file
+			newSelected = 0
+			sameFile = (len(m.files) > 0 && m.files[0].Path == selectedPath)
+		} else {
+			// Find the same file we had selected
+			for i, f := range m.files {
+				if f.Path == selectedPath {
+					newSelected = i
+					sameFile = true
+					break
+				}
 			}
 		}
 		m.selected = newSelected
@@ -203,9 +217,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selected = 0
 		}
 		
-		// Force preview refresh (even for same file) to update diffs
+		// Refresh preview content (for updated diffs) but preserve scroll if same file
 		m.lastSelectedFile = -1
-		m.updatePreview()
+		m.updatePreviewKeepScroll(sameFile)
 
 	case RefreshMsg:
 		return m, m.loadFiles
@@ -232,6 +246,10 @@ func (m *Model) recalculateViewport() {
 }
 
 func (m *Model) updatePreview() {
+	m.updatePreviewKeepScroll(false)
+}
+
+func (m *Model) updatePreviewKeepScroll(keepScroll bool) {
 	if !m.previewReady || len(m.files) == 0 {
 		m.preview = PreviewContent{}
 		m.viewport.SetContent("")
@@ -239,7 +257,7 @@ func (m *Model) updatePreview() {
 		return
 	}
 
-	// Skip if we already have this file loaded
+	// Skip if we already have this file loaded (unless forced refresh)
 	if m.selected == m.lastSelectedFile && m.preview.Valid {
 		return
 	}
@@ -251,7 +269,9 @@ func (m *Model) updatePreview() {
 	if strings.Contains(file.GitCode, "D") {
 		m.preview = PreviewContent{Valid: true, Message: fmt.Sprintf("%s was deleted", file.Path)}
 		m.viewport.SetContent(m.renderPreviewContent())
-		m.viewport.GotoTop()
+		if !keepScroll {
+			m.viewport.GotoTop()
+		}
 		m.lastSelectedFile = m.selected
 		return
 	}
@@ -264,7 +284,9 @@ func (m *Model) updatePreview() {
 		}
 		m.preview = PreviewContent{Valid: true, Message: fmt.Sprintf("%s\n%s", filepath.Base(file.Path), reason)}
 		m.viewport.SetContent(m.renderPreviewContent())
-		m.viewport.GotoTop()
+		if !keepScroll {
+			m.viewport.GotoTop()
+		}
 		m.lastSelectedFile = m.selected
 		return
 	}
@@ -289,22 +311,28 @@ func (m *Model) updatePreview() {
 	if err != nil {
 		m.preview = PreviewContent{Valid: true, Message: fmt.Sprintf("couldn't read %s", file.Path)}
 		m.viewport.SetContent(m.renderPreviewContent())
-		m.viewport.GotoTop()
+		if !keepScroll {
+			m.viewport.GotoTop()
+		}
 		m.lastSelectedFile = m.selected
 		return
 	}
 
 	rawLines := strings.Split(string(content), "\n")
+	highlightedLines := highlightCode(string(content), file.Path)
 
 	m.preview = PreviewContent{
-		Valid:     true,
-		RawLines:  rawLines,
-		DiffLines: diffLines,
-		DiffStats: diffStats,
+		Valid:            true,
+		RawLines:         rawLines,
+		HighlightedLines: highlightedLines,
+		DiffLines:        diffLines,
+		DiffStats:        diffStats,
 	}
 
 	m.viewport.SetContent(m.renderPreviewContent())
-	m.viewport.GotoTop()
+	if !keepScroll {
+		m.viewport.GotoTop()
+	}
 	m.lastSelectedFile = m.selected
 }
 
@@ -344,35 +372,38 @@ func (m *Model) renderPreviewContent() string {
 		maxLineLen = 20
 	}
 
-	for i, line := range m.preview.RawLines {
+	for i := range m.preview.RawLines {
 		lineNum := i + 1
 
-		// Truncate long lines
-		content := line
-		if len(content) > maxLineLen {
-			content = content[:maxLineLen-3] + "..."
+		// Get raw content
+		rawContent := m.preview.RawLines[i]
+		if len(rawContent) > maxLineLen {
+			rawContent = rawContent[:maxLineLen-3] + "..."
 		}
 
-		// Apply diff styling
+		// Check if this is a diff line
 		status, isDiff := m.preview.DiffLines[lineNum]
-		if isDiff {
-			if status == "added" {
-				content = lineAddStyle.Render(content)
-			} else {
-				content = lineDelStyle.Render(content)
-			}
-		}
 
-		// Build gutter
+		// Build gutter and content based on diff status
 		var gutter string
+		var content string
 		if isDiff {
+			// Diff lines: colored gutter and colored content
 			if status == "added" {
 				gutter = "  " + lineAddStyle.Render("+") + " "
+				content = lineAddStyle.Render(rawContent)
 			} else {
 				gutter = "  " + lineDelStyle.Render("-") + " "
+				content = lineDelStyle.Render(rawContent)
 			}
 		} else {
+			// Normal lines: dim gutter, syntax highlighted content
 			gutter = "  " + dimStyle.Render("·") + " "
+			if i < len(m.preview.HighlightedLines) && m.preview.HighlightedLines[i] != "" {
+				content = m.preview.HighlightedLines[i]
+			} else {
+				content = rawContent
+			}
 		}
 
 		b.WriteString(gutter + content)
@@ -384,14 +415,9 @@ func (m *Model) renderPreviewContent() string {
 	return b.String()
 }
 
-// highlightCode returns syntax-highlighted lines (unused for now, keeping for future)
+// highlightCode returns syntax-highlighted lines using Catppuccin theme
 func highlightCode(content, filename string) []string {
-	lines := strings.Split(content, "\n")
-
-	ext := strings.ToLower(filepath.Ext(filename))
-	if ext == ".go" {
-		return lines
-	}
+	rawLines := strings.Split(content, "\n")
 
 	lexer := lexers.Match(filename)
 	if strings.HasSuffix(filename, ".erb") {
@@ -401,11 +427,18 @@ func highlightCode(content, filename string) []string {
 		}
 	}
 	if lexer == nil {
-		return lines
+		return rawLines
 	}
 	lexer = chroma.Coalesce(lexer)
 
-	style := styles.Get("nord")
+	// Use Catppuccin theme based on terminal background
+	var styleName string
+	if lipgloss.HasDarkBackground() {
+		styleName = "catppuccin-mocha"
+	} else {
+		styleName = "catppuccin-latte"
+	}
+	style := styles.Get(styleName)
 	if style == nil {
 		style = styles.Fallback
 	}
@@ -415,8 +448,15 @@ func highlightCode(content, filename string) []string {
 		formatter = formatters.Fallback
 	}
 
-	highlightedLines := make([]string, len(lines))
-	for i, line := range lines {
+	// Highlight each line independently to avoid ANSI bleed between lines
+	highlightedLines := make([]string, len(rawLines))
+	for i, line := range rawLines {
+		// Skip empty lines
+		if strings.TrimSpace(line) == "" {
+			highlightedLines[i] = line
+			continue
+		}
+
 		iterator, err := lexer.Tokenise(nil, line)
 		if err != nil {
 			highlightedLines[i] = line
@@ -430,7 +470,12 @@ func highlightCode(content, filename string) []string {
 			continue
 		}
 
+		// Clean up: trim trailing newline and ensure ANSI reset at end
 		highlighted := strings.TrimSuffix(buf.String(), "\n")
+		// Add reset sequence to prevent color bleed
+		if !strings.HasSuffix(highlighted, "\033[0m") {
+			highlighted += "\033[0m"
+		}
 		highlightedLines[i] = highlighted
 	}
 
@@ -592,8 +637,9 @@ func (m Model) renderPreviewHeader() string {
 }
 
 func (m Model) renderFooter() string {
-	hint := keyStyle.Render("q") + dimStyle.Render(" quit  ")
-	return padLine("", hint, m.width)
+	leftHint := dimStyle.Render("hold ") + keyStyle.Render("shift") + dimStyle.Render(" to select text")
+	rightHint := keyStyle.Render("q") + dimStyle.Render(" quit  ")
+	return padLine(leftHint, rightHint, m.width)
 }
 
 // Helper functions
@@ -616,9 +662,9 @@ func padLine(left, right string, width int) string {
 }
 
 func (m Model) renderLoadingScreen() string {
-	// ASCII art cloud with PERCH title
+	// ASCII art cloud
 	art := []string{
-		"                 _ (      ) _                PERCH",
+		"                 _ (      ) _",
 		"           _  . (            )  .  _",
 		"       _ (                          ) _",
 		"     (   @@@%%##**++--..               )",
@@ -633,7 +679,7 @@ func (m Model) renderLoadingScreen() string {
 	var lines []string
 	
 	// Vertical centering
-	totalArtHeight := len(art) + 2 // art + gap + message
+	totalArtHeight := len(art) + 2 // art + gap + title
 	topPad := (m.height - totalArtHeight) / 2
 	if topPad < 0 {
 		topPad = 0
@@ -655,13 +701,13 @@ func (m Model) renderLoadingScreen() string {
 	
 	lines = append(lines, "") // gap
 	
-	// Loading message
-	msg := "scanning..."
-	msgPad := (m.width - len(msg)) / 2
-	if msgPad < 0 {
-		msgPad = 0
+	// Title
+	title := "STAY PERCHED"
+	titlePad := (m.width - len(title)) / 2
+	if titlePad < 0 {
+		titlePad = 0
 	}
-	lines = append(lines, strings.Repeat(" ", msgPad)+dimStyle.Render(msg))
+	lines = append(lines, strings.Repeat(" ", titlePad)+title)
 	
 	// Pad to full height
 	for len(lines) < m.height {
