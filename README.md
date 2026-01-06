@@ -11,6 +11,12 @@ Perch shows the most recent changes in any git directory. Whatever your agent ju
 
 ## Install
 
+**Homebrew:**
+```
+brew install kateleext/tap/perch
+```
+
+**Go:**
 ```
 go install github.com/kateleext/perch/cmd/perch@latest
 ```
