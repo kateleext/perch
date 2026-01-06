@@ -1,38 +1,27 @@
-# Perch
+# PERCH
 
-Passive file monitor for coding sessions. Watch what's changing from above.
+**Stay perched on reality while agents work.**
 
-> The bird's eye view of your work.
+Minimal terminal file viewer for monitoring changes in any git directory.
 
 ## Install
 
-```bash
-go install github.com/takumahq/perch@latest
 ```
-
-Or build from source:
-
-```bash
-make build
+go install github.com/kateleext/perch@latest
 ```
 
 ## Usage
 
-```bash
-# Watch current directory
-perch
-
-# Watch specific directory
-perch /path/to/project
-
-# Vertical layout
-perch -v
+```
+perch [directory]
 ```
 
-## Proof of Concept
+## Keybindings
 
-Before building the full TUI, validate the concept works:
-
-```bash
-./poc/perch.sh
-```
+| Key | Action |
+|-----|--------|
+| `↑↓` | Navigate files |
+| `j/k` | Scroll preview |
+| `g/G` | Top/bottom |
+| `q` | Quit |
+| `shift` + select | Copy text |
