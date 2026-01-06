@@ -8,6 +8,73 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// === TYPES ===
+
+// ViewSnapshot captures the immutable state needed to render a frame
+type ViewSnapshot struct {
+	Files         []FilePreview
+	SelectedIdx   int
+	ListScroll    int
+	PreviewScroll int
+	ListHeight    int
+	Width         int
+	Height        int
+	SparkleOn     bool
+	Dir           string
+}
+
+// FilePreview is the subset of FileStatus needed for rendering
+type FilePreview struct {
+	Path       string
+	Status     string
+	GitCode    string
+	ChangeType string
+	IsSelected bool
+}
+
+// === SNAPSHOT CREATION ===
+
+// captureSnapshot creates an immutable view of current state
+func (m Model) captureSnapshot() ViewSnapshot {
+	fileSnapshots := make([]FilePreview, len(m.files))
+	for i, f := range m.files {
+		fileSnapshots[i] = FilePreview{
+			Path:       f.Path,
+			Status:     f.Status,
+			GitCode:    f.GitCode,
+			ChangeType: f.ChangeType(),
+			IsSelected: (i == m.selected),
+		}
+	}
+
+	return ViewSnapshot{
+		Files:         fileSnapshots,
+		SelectedIdx:   m.selected,
+		ListScroll:    m.listScroll,
+		PreviewScroll: m.previewScroll,
+		ListHeight:    m.listHeight,
+		Width:         m.width,
+		Height:        m.height,
+		SparkleOn:     m.sparkleOn,
+		Dir:           m.dir,
+	}
+}
+
+// === HELPER FUNCTIONS ===
+
+// padRightString adds padding between left and right content for exact width
+func padRightString(left, right string, width int) string {
+	leftLen := lipgloss.Width(left)
+	rightLen := lipgloss.Width(right)
+	padding := width - leftLen - rightLen - 1
+	if padding < 1 {
+		padding = 1
+	}
+	return left + strings.Repeat(" ", padding) + right
+}
+
+// === RENDERING ===
+
 // Clean view rendering with clear separation of concerns
 // Layout is simple: TOP = file list, BOTTOM = preview, FOOTER = quit hint
 
