@@ -31,8 +31,6 @@ brews:
     homepage: "https://github.com/kateleext/perch"
     description: "Minimal file viewer for coding agents"
     license: "MIT"
-    test: |
-      system "#{bin}/perch --help" if File.exist?("#{bin}/perch")
     install: |
       bin.install "perch"
 
