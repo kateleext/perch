@@ -22,14 +22,41 @@ import (
 var DevBuild = false
 
 // Version is the current version of perch
-var Version = "0.0.2"
+var Version = "0.0.3"
 
-// ANSI background codes for diff lines
+// ANSI codes for diff lines
 const (
 	bgAddANSI = "\033[48;2;12;28;12m" // #0c1c0c - very dark green
 	bgDelANSI = "\033[48;2;32;12;12m" // #200c0c - very dark red
+	fgAddANSI = "\033[38;2;80;180;80m" // muted green text
+	fgDelANSI = "\033[38;2;180;80;80m" // muted red text
 	ansiReset = "\033[0m"
 )
+
+// stripANSIColors removes all ANSI escape sequences from a string
+func stripANSIColors(s string) string {
+	var result strings.Builder
+	i := 0
+	for i < len(s) {
+		if i+1 < len(s) && s[i] == 0x1b && s[i+1] == '[' {
+			// Skip ANSI sequence
+			j := i + 2
+			for j < len(s) {
+				b := s[j]
+				if b >= 0x40 && b <= 0x7E {
+					j++
+					break
+				}
+				j++
+			}
+			i = j
+		} else {
+			result.WriteByte(s[i])
+			i++
+		}
+	}
+	return result.String()
+}
 
 // Styles
 var (
@@ -411,8 +438,14 @@ func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
 
 		rawLines := strings.Split(string(content), "\n")
 		var highlightedLines []string
-		if isMarkdownFile(file.Path) {
+		if isMarkdownERBFile(file.Path) {
 			highlightedLines = highlightMarkdownLines(rawLines, file.Path)
+			highlightedLines = applyERBStyling(highlightedLines)
+		} else if isMarkdownFile(file.Path) {
+			highlightedLines = highlightMarkdownLines(rawLines, file.Path)
+		} else if isERBFile(file.Path) {
+			highlightedLines = highlightCode(string(content), file.Path)
+			highlightedLines = applyERBStyling(highlightedLines)
 		} else {
 			highlightedLines = highlightCode(string(content), file.Path)
 		}
@@ -518,8 +551,14 @@ func (m *Model) updatePreviewKeepScroll(keepScroll bool) {
 
 	rawLines := strings.Split(string(content), "\n")
 	var highlightedLines []string
-	if isMarkdownFile(file.Path) {
+	if isMarkdownERBFile(file.Path) {
 		highlightedLines = highlightMarkdownLines(rawLines, file.Path)
+		highlightedLines = applyERBStyling(highlightedLines)
+	} else if isMarkdownFile(file.Path) {
+		highlightedLines = highlightMarkdownLines(rawLines, file.Path)
+	} else if isERBFile(file.Path) {
+		highlightedLines = highlightCode(string(content), file.Path)
+		highlightedLines = applyERBStyling(highlightedLines)
 	} else {
 		highlightedLines = highlightCode(string(content), file.Path)
 	}
@@ -573,14 +612,17 @@ func (m *Model) renderPreviewContent() string {
 	for i, vl := range wrappedLines {
 		var gutter string
 		var bgCode string
+		var fgCode string
 
 		switch vl.DiffStatus {
 		case "added":
 			gutter = "  " + lineAddGutter.Render(vl.Gutter)
 			bgCode = bgAddANSI
+			fgCode = fgAddANSI
 		case "deleted":
 			gutter = "  " + lineDelGutter.Render(vl.Gutter)
 			bgCode = bgDelANSI
+			fgCode = fgDelANSI
 		default:
 			gutter = "  " + lineDotStyle.Render(vl.Gutter)
 		}
@@ -600,7 +642,9 @@ func (m *Model) renderPreviewContent() string {
 		text := vl.Text
 		if bgCode != "" {
 			gutter = InjectBackground(gutter, bgCode)
-			text = InjectBackground(vl.Text, bgCode)
+			// Apply foreground color to text (overrides syntax highlighting)
+			text = fgCode + stripANSIColors(vl.Text) + ansiReset
+			text = InjectBackground(text, bgCode)
 		}
 
 		// Build final line - for diff lines, wrap everything in background
@@ -673,7 +717,7 @@ func isMarkdownFile(path string) bool {
 	return false
 }
 
-// highlightCode returns syntax-highlighted lines using Catppuccin theme
+// highlightCode returns syntax-highlighted lines using algol theme
 func highlightCode(content, filename string) []string {
 	rawLines := strings.Split(content, "\n")
 
@@ -689,13 +733,7 @@ func highlightCode(content, filename string) []string {
 	}
 	lexer = chroma.Coalesce(lexer)
 
-	// Use Catppuccin theme based on terminal background
-	var styleName string
-	if lipgloss.HasDarkBackground() {
-		styleName = "catppuccin-mocha"
-	} else {
-		styleName = "catppuccin-latte"
-	}
+	styleName := "algol"
 	style := styles.Get(styleName)
 	if style == nil {
 		style = styles.Fallback

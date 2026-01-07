@@ -204,10 +204,7 @@ func highlightCodeFenceLine(line, lang string) string {
 	}
 	lexer = chroma.Coalesce(lexer)
 
-	styleName := "catppuccin-mocha"
-	if !lipgloss.HasDarkBackground() {
-		styleName = "catppuccin-latte"
-	}
+	styleName := "algol"
 	style := styles.Get(styleName)
 	if style == nil {
 		style = styles.Fallback
