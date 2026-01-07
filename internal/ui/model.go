@@ -336,10 +336,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.viewport.SetContent(m.renderPreviewContent())
-		m.viewport.GotoTop()
+		
+		// Auto-scroll to first diff for uncommitted files
+		if msg.selectedIndex < len(m.files) {
+			file := m.files[msg.selectedIndex]
+			if file.Status == "uncommitted" && len(m.preview.DiffLines) > 0 {
+				m.scrollToFirstDiff()
+			} else {
+				m.viewport.GotoTop()
+			}
+		} else {
+			m.viewport.GotoTop()
+		}
+		
 		m.lastSelectedFile = msg.selectedIndex
 		m.previewPending = -1
 	}
+
 
 	return m, tea.Batch(cmds...)
 }
@@ -418,8 +431,9 @@ func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
 }
 
 func (m *Model) recalculateViewport() {
-	// Layout: fileList (listHeight) + divider (1) + previewHeader (1) + underline (1) + viewport + footer (1)
-	previewHeight := m.height - m.listHeight - 4
+	// Layout: fileList (listHeight) + divider (1) + previewHeader (1) + underline (1) + viewport + indicators (up to 2) + footer (1)
+	// Reserve space for up to 2 indicator lines (top + bottom dots) to keep layout stable
+	previewHeight := m.height - m.listHeight - 6
 	if previewHeight < 1 {
 		previewHeight = 1
 	}
@@ -612,7 +626,44 @@ func (m *Model) renderPreviewContent() string {
 	return b.String()
 }
 
+// scrollToFirstDiff scrolls the viewport to the first diff line with context
+func (m *Model) scrollToFirstDiff() {
+	wrappedLines := m.preview.WrappedLinesForWidth(m.width)
+	
+	// Find the first line with a diff status
+	firstDiffIndex := -1
+	for i, vl := range wrappedLines {
+		if vl.DiffStatus == "added" || vl.DiffStatus == "deleted" {
+			firstDiffIndex = i
+			break
+		}
+	}
+	
+	if firstDiffIndex == -1 {
+		// No diff found, go to top
+		m.viewport.GotoTop()
+		return
+	}
+	
+	// Add context lines above (3 lines of context)
+	contextLines := 3
+	targetOffset := firstDiffIndex - contextLines
+	if targetOffset < 0 {
+		targetOffset = 0
+	}
+	
+	// Don't scroll if the diff is already near the top
+	if targetOffset <= 2 {
+		m.viewport.GotoTop()
+		return
+	}
+	
+	// Set the viewport offset
+	m.viewport.SetYOffset(targetOffset)
+}
+
 // isMarkdownFile checks if a file is markdown based on extension
+
 func isMarkdownFile(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
@@ -740,13 +791,41 @@ func (m Model) View() string {
 	b.WriteString(m.renderPreviewHeader())
 	b.WriteString(dividerStyle.Render(strings.Repeat("─", m.width)) + "\n")
 
-	// === VIEWPORT (preview content) ===
-	b.WriteString(m.viewport.View() + "\n")
+	// === VIEWPORT (preview content with scroll indicators) ===
+	b.WriteString(m.renderPreviewWithIndicators())
 
 	// === FOOTER ===
 	b.WriteString(m.renderFooter())
 
 	return b.String()
+}
+
+// renderPreviewWithIndicators renders the viewport with scroll indicators at display level
+func (m Model) renderPreviewWithIndicators() string {
+	var lines []string
+
+	// Check if we should show top indicator
+	showTopDots := m.viewport.YOffset > 0
+
+	// Check if we should show bottom indicator
+	totalContentLines := m.viewport.TotalLineCount()
+	visibleEnd := m.viewport.YOffset + m.viewport.Height
+	showBottomDots := visibleEnd < totalContentLines
+
+	// Top indicator
+	if showTopDots {
+		lines = append(lines, cyanStyle.Render("  ..."))
+	}
+
+	// Main viewport content
+	lines = append(lines, m.viewport.View())
+
+	// Bottom indicator
+	if showBottomDots {
+		lines = append(lines, cyanStyle.Render("  ..."))
+	}
+
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func (m Model) renderFileList() string {
