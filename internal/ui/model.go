@@ -21,28 +21,42 @@ import (
 // DevBuild indicates if this is a development build
 var DevBuild = false
 
+// Version is the current version of perch
+var Version = "0.0.2"
+
 // ANSI background codes for diff lines
 const (
-	bgAddANSI = "\033[48;2;18;40;18m" // #122812 - darker green
-	bgDelANSI = "\033[48;2;45;18;18m" // #2d1212 - darker red
+	bgAddANSI = "\033[48;2;12;28;12m" // #0c1c0c - very dark green
+	bgDelANSI = "\033[48;2;32;12;12m" // #200c0c - very dark red
 	ansiReset = "\033[0m"
 )
 
 // Styles
 var (
-	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	cyanStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("109"))
-	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("109"))
-	dividerStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	keyStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-	lineAddGutter = lipgloss.NewStyle().Foreground(lipgloss.Color("#5a8a5a")) // muted green, blends with bg
-	lineDelGutter = lipgloss.NewStyle().Foreground(lipgloss.Color("#8a5a5a")) // muted red, blends with bg
-	blueStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))  // Subtle blue for sparkle
-	blueDimStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("67"))  // Dimmer blue for sparkle off
+	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	cyanStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("109"))
+	selectedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("109"))
+	dividerStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	keyStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	lineAddGutter  = lipgloss.NewStyle().Foreground(lipgloss.Color("#5a8a5a")) // muted green, blends with bg
+	lineDelGutter  = lipgloss.NewStyle().Foreground(lipgloss.Color("#8a5a5a")) // muted red, blends with bg
+	lineDotStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))     // very subtle dots
+	sparkleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("255"))     // white sparkle
 )
 
 // TickMsg for sparkle animation
 type TickMsg time.Time
+
+// previewRequestMsg signals that a debounced preview load should start
+type previewRequestMsg struct {
+	selectedIndex int
+}
+
+// previewLoadedMsg carries the async-loaded preview content
+type previewLoadedMsg struct {
+	selectedIndex int
+	preview       PreviewContent
+}
 
 // PreviewContent holds the rendered preview data for a specific file
 type PreviewContent struct {
@@ -91,6 +105,8 @@ type Model struct {
 	loading          bool // true until first filesLoadedMsg
 	loadingFrame     int  // track animation frame for loading screen
 	loadingStartTime time.Time // track when loading started
+	previewPending   int  // index of pending preview request (-1 = none)
+	previewCache     map[string]PreviewContent // cache by file path
 }
 
 // New creates a new UI model
@@ -104,6 +120,8 @@ func New(dir string) Model {
 		viewport:         viewport.New(80, 10),
 		loading:          true, // Start in loading state
 		loadingStartTime: time.Now(),
+		previewPending:   -1,
+		previewCache:     make(map[string]PreviewContent),
 	}
 }
 
@@ -113,6 +131,13 @@ type RefreshMsg struct{}
 func tickCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
 		return TickMsg(t)
+	})
+}
+
+// debouncePreviewCmd waits briefly then signals to load the preview
+func debouncePreviewCmd(selectedIndex int) tea.Cmd {
+	return tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg {
+		return previewRequestMsg{selectedIndex: selectedIndex}
 	})
 }
 
@@ -149,7 +174,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.listScroll = 0
 					}
 				}
-				m.updatePreview()
+				m.previewPending = m.selected
+				cmds = append(cmds, debouncePreviewCmd(m.selected))
 			}
 		case "down":
 			if m.selected < len(m.files)-1 {
@@ -165,7 +191,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.selected >= m.listScroll+visibleCapacity-bottomBuffer {
 					m.listScroll = m.selected - visibleCapacity + bottomBuffer + 1
 				}
-				m.updatePreview()
+				m.previewPending = m.selected
+				cmds = append(cmds, debouncePreviewCmd(m.selected))
 			}
 		case "j":
 			m.viewport.LineDown(1)
@@ -189,6 +216,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.listHeight--
 				m.recalculateViewport()
 			}
+		case "shift+up":
+			// Jump to top file
+			if m.selected != 0 {
+				m.selected = 0
+				m.listScroll = 0
+				m.previewPending = m.selected
+				cmds = append(cmds, debouncePreviewCmd(m.selected))
+			}
 		}
 
 	case tea.MouseMsg:
@@ -209,12 +244,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.recalculateViewport()
 
 	case filesLoadedMsg:
-		// Enforce minimum 3 second loading screen
-		if time.Since(m.loadingStartTime) < 3*time.Second {
-			m.loading = true
-		} else {
-			m.loading = false
-		}
+		m.loading = false
 		
 		// Remember if we were at the top file
 		wasAtTop := m.selected == 0
@@ -269,9 +299,122 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Refresh files and diffs every tick
 		return m, tea.Batch(tickCmd(), m.loadFiles)
+
+	case previewRequestMsg:
+		// Only load if this is still the pending request (debounce)
+		if msg.selectedIndex != m.previewPending {
+			return m, nil
+		}
+		if msg.selectedIndex < 0 || msg.selectedIndex >= len(m.files) {
+			return m, nil
+		}
+		// Check cache first
+		file := m.files[msg.selectedIndex]
+		if cached, ok := m.previewCache[file.Path]; ok && file.Status == "committed" {
+			// Use cached preview for committed files (they don't change)
+			m.preview = cached
+			m.viewport.SetContent(m.renderPreviewContent())
+			m.viewport.GotoTop()
+			m.lastSelectedFile = msg.selectedIndex
+			m.previewPending = -1
+			return m, nil
+		}
+		// Load async
+		return m, m.loadPreviewAsync(msg.selectedIndex)
+
+	case previewLoadedMsg:
+		// Only apply if still relevant
+		if msg.selectedIndex != m.selected {
+			return m, nil
+		}
+		m.preview = msg.preview
+		// Cache committed file previews
+		if msg.selectedIndex < len(m.files) {
+			file := m.files[msg.selectedIndex]
+			if file.Status == "committed" {
+				m.previewCache[file.Path] = msg.preview
+			}
+		}
+		m.viewport.SetContent(m.renderPreviewContent())
+		m.viewport.GotoTop()
+		m.lastSelectedFile = msg.selectedIndex
+		m.previewPending = -1
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+// loadPreviewAsync returns a command that loads preview content in the background
+func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
+	file := m.files[selectedIndex]
+	dir := m.dir
+	gitRoot := m.gitRoot
+	if file.GitRoot != "" {
+		gitRoot = file.GitRoot
+	}
+
+	return func() tea.Msg {
+		fullPath := filepath.Join(dir, file.Path)
+
+		// Check if file was deleted
+		if strings.Contains(file.GitCode, "D") {
+			return previewLoadedMsg{
+				selectedIndex: selectedIndex,
+				preview:       PreviewContent{Valid: true, Message: fmt.Sprintf("%s was deleted", file.Path)},
+			}
+		}
+
+		// Check if file type is unsupported
+		if isUnsupportedFile(file.Path) {
+			reason := "not supported in perch"
+			if filepath.Ext(file.Path) == "" {
+				reason = "no file extension — open in your editor"
+			}
+			return previewLoadedMsg{
+				selectedIndex: selectedIndex,
+				preview:       PreviewContent{Valid: true, Message: fmt.Sprintf("%s\n%s", filepath.Base(file.Path), reason)},
+			}
+		}
+
+		// Get diff info
+		var diffLines map[int]string
+		var diffStats git.DiffStats
+		if file.Status == "uncommitted" {
+			diffLines = git.GetDiffLines(gitRoot, file.FullPath)
+			diffStats = git.GetDiffStats(gitRoot, file.FullPath)
+		} else {
+			diffLines = make(map[int]string)
+			diffStats = git.DiffStats{}
+		}
+
+		// Read file content
+		content, err := os.ReadFile(fullPath)
+		if err != nil {
+			return previewLoadedMsg{
+				selectedIndex: selectedIndex,
+				preview:       PreviewContent{Valid: true, Message: fmt.Sprintf("couldn't read %s", file.Path)},
+			}
+		}
+
+		rawLines := strings.Split(string(content), "\n")
+		var highlightedLines []string
+		if isMarkdownFile(file.Path) {
+			highlightedLines = highlightMarkdownLines(rawLines, file.Path)
+		} else {
+			highlightedLines = highlightCode(string(content), file.Path)
+		}
+
+		return previewLoadedMsg{
+			selectedIndex: selectedIndex,
+			preview: PreviewContent{
+				Valid:            true,
+				RawLines:         rawLines,
+				HighlightedLines: highlightedLines,
+				DiffLines:        diffLines,
+				DiffStats:        diffStats,
+			},
+		}
+	}
 }
 
 func (m *Model) recalculateViewport() {
@@ -360,7 +503,12 @@ func (m *Model) updatePreviewKeepScroll(keepScroll bool) {
 	}
 
 	rawLines := strings.Split(string(content), "\n")
-	highlightedLines := highlightCode(string(content), file.Path)
+	var highlightedLines []string
+	if isMarkdownFile(file.Path) {
+		highlightedLines = highlightMarkdownLines(rawLines, file.Path)
+	} else {
+		highlightedLines = highlightCode(string(content), file.Path)
+	}
 
 	m.preview = PreviewContent{
 		Valid:            true,
@@ -420,7 +568,7 @@ func (m *Model) renderPreviewContent() string {
 			gutter = "  " + lineDelGutter.Render(vl.Gutter)
 			bgCode = bgDelANSI
 		default:
-			gutter = "  " + dimStyle.Render(vl.Gutter)
+			gutter = "  " + lineDotStyle.Render(vl.Gutter)
 		}
 
 		// Calculate visible width BEFORE any background injection
@@ -462,6 +610,16 @@ func (m *Model) renderPreviewContent() string {
 	}
 
 	return b.String()
+}
+
+// isMarkdownFile checks if a file is markdown based on extension
+func isMarkdownFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".md", ".markdown", ".mdown", ".mdx":
+		return true
+	}
+	return false
 }
 
 // highlightCode returns syntax-highlighted lines using Catppuccin theme
@@ -557,13 +715,17 @@ func isUnsupportedFile(path string) bool {
 
 // View implements tea.Model
 func (m Model) View() string {
-	if m.width == 0 || m.height == 0 {
-		return ""
+	// Show loading screen instantly, even before dimensions arrive
+	if m.loading {
+		if m.width == 0 || m.height == 0 {
+			// Minimal instant display before window size is known
+			return "\n\n  " + cyanStyle.Render("PERCH") + "\n"
+		}
+		return m.renderLoadingScreen()
 	}
 
-	// Show loading screen
-	if m.loading {
-		return m.renderLoadingScreen()
+	if m.width == 0 || m.height == 0 {
+		return ""
 	}
 
 	var b strings.Builder
@@ -590,20 +752,20 @@ func (m Model) View() string {
 func (m Model) renderFileList() string {
 	var lines []string
 
-	// Header line: sparkle + "LATEST PROGRESS" + arrows on left, "perched on path" on right
+	// Header line: sparkle + "PERCHED ON PROGRESS" on left, "...path" on right
 	var sparkle string
 	if m.sparkleOn {
-		sparkle = blueStyle.Render("✧")
+		sparkle = sparkleStyle.Render("✧")
 	} else {
-		sparkle = blueDimStyle.Render("✧")
+		sparkle = " " // invisible when off
 	}
 	shortPath := truncatePath(m.dir, 2)
 	devMarker := ""
 	if DevBuild {
 		devMarker = dimStyle.Render("[dev] ")
 	}
-	header := devMarker + sparkle + " " + dimStyle.Render("LATEST PROGRESS") + "  " + dimStyle.Render("↑↓")
-	pathHint := dimStyle.Render("perched on ") + dimStyle.Render(shortPath)
+	header := devMarker + dimStyle.Render("PERCHED ON PROGRESS") + " " + sparkle
+	pathHint := dimStyle.Render("..." + shortPath)
 	lines = append(lines, padLine(header, pathHint, m.width))
 
 	if len(m.files) == 0 {
@@ -716,71 +878,69 @@ func padLine(left, right string, width int) string {
 }
 
 func (m Model) renderLoadingScreen() string {
-	// ASCII art cloud
-	art := []string{
-		"                 _ (      ) _",
-		"           _  . (            )  .  _",
-		"       _ (                          ) _",
-		"     (   @@@%%##**++--..               )",
-		"   (  @@@@@@@@%%%%####***+++--..         )",
-		" (  @@@@@@@@@@@@@@@%%%%%%#####*****+++--.  )",
-		"(  @@@@@@@@@@@@@@@@@@@@@@@%%%%%%%######***** )",
-		" (  @@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%#####  )",
-		"   (   @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%   )",
-		"     (____________________________________)",
-	}
-
 	var lines []string
-	
-	// Vertical centering
-	totalArtHeight := len(art) + 2 // art + gap + title
-	topPad := (m.height - totalArtHeight) / 2
+
+	// Block ASCII art for PERCH
+	ascii := []string{
+		"██████╗ ███████╗██████╗  ██████╗██╗  ██╗",
+		"██╔══██╗██╔════╝██╔══██╗██╔════╝██║  ██║",
+		"██████╔╝█████╗  ██████╔╝██║     ███████║",
+		"██╔═══╝ ██╔══╝  ██╔══██╗██║     ██╔══██║",
+		"██║     ███████╗██║  ██║╚██████╗██║  ██║",
+		"╚═╝     ╚══════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝",
+	}
+	asciiWidth := 40
+
+	// Content height: ascii (6) + gap + version + gap + tagline = 10
+	totalContentHeight := 10
+	topPad := (m.height - totalContentHeight) / 2
 	if topPad < 0 {
 		topPad = 0
 	}
-	
+
 	for i := 0; i < topPad; i++ {
 		lines = append(lines, "")
 	}
-	
-	// Art (centered) with fade-in animation
-	artWidth := 53
-	padLeft := (m.width - artWidth) / 2
-	if padLeft < 0 {
-		padLeft = 0
+
+	// PERCH ASCII in cyan
+	asciiPad := (m.width - asciiWidth) / 2
+	if asciiPad < 0 {
+		asciiPad = 0
 	}
-	
-	// Calculate opacity based on animation frame (0-10)
-	opacity := m.loadingFrame
-	if opacity > 10 {
-		opacity = 10
+	for _, line := range ascii {
+		lines = append(lines, strings.Repeat(" ", asciiPad)+cyanStyle.Render(line))
 	}
-	
-	for _, line := range art {
-		renderedLine := strings.Repeat(" ", padLeft) + line
-		// Apply fade-in by adjusting opacity
-		if opacity < 10 {
-			renderedLine = strings.Repeat(" ", padLeft) + dimStyle.Render(line)
-		} else {
-			renderedLine = strings.Repeat(" ", padLeft) + line
-		}
-		lines = append(lines, renderedLine)
+
+	// Version
+	versionStr := dimStyle.Render(Version)
+	versionPad := (m.width - len(Version)) / 2
+	if versionPad < 0 {
+		versionPad = 0
 	}
-	
+	lines = append(lines, strings.Repeat(" ", versionPad)+versionStr)
+
 	lines = append(lines, "") // gap
-	
-	// Title
-	title := "keeping an eye on the progress..."
-	titlePad := (m.width - len(title)) / 2
-	if titlePad < 0 {
-		titlePad = 0
+
+	// Tagline
+	tagline := dimStyle.Render("let's keep an eye on the progress.")
+	taglinePad := (m.width - 34) / 2
+	if taglinePad < 0 {
+		taglinePad = 0
 	}
-	lines = append(lines, strings.Repeat(" ", titlePad)+title)
-	
-	// Pad to full height
-	for len(lines) < m.height {
+	lines = append(lines, strings.Repeat(" ", taglinePad)+tagline)
+
+	// Pad to leave room for attribution at bottom
+	for len(lines) < m.height-1 {
 		lines = append(lines, "")
 	}
-	
+
+	// Attribution at bottom
+	attr := dimStyle.Render("@kateleext")
+	attrPad := (m.width - 10) / 2
+	if attrPad < 0 {
+		attrPad = 0
+	}
+	lines = append(lines, strings.Repeat(" ", attrPad)+attr)
+
 	return strings.Join(lines, "\n")
 }

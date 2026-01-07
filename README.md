@@ -25,16 +25,16 @@ go install github.com/kateleext/perch/cmd/perch@latest
 **Direct:**
 ```
 # macOS arm64 (Apple Silicon)
-curl -L https://github.com/kateleext/perch/releases/download/v0.0.1/perch_darwin_arm64.tar.gz | tar xz -C /usr/local/bin
+curl -L https://github.com/kateleext/perch/releases/download/v0.0.2/perch_darwin_arm64.tar.gz | tar xz -C /usr/local/bin
 
 # macOS x86_64 (Intel)
-curl -L https://github.com/kateleext/perch/releases/download/v0.0.1/perch_darwin_amd64.tar.gz | tar xz -C /usr/local/bin
+curl -L https://github.com/kateleext/perch/releases/download/v0.0.2/perch_darwin_amd64.tar.gz | tar xz -C /usr/local/bin
 
 # Linux arm64
-curl -L https://github.com/kateleext/perch/releases/download/v0.0.1/perch_linux_arm64.tar.gz | tar xz -C /usr/local/bin
+curl -L https://github.com/kateleext/perch/releases/download/v0.0.2/perch_linux_arm64.tar.gz | tar xz -C /usr/local/bin
 
 # Linux x86_64
-curl -L https://github.com/kateleext/perch/releases/download/v0.0.1/perch_linux_amd64.tar.gz | tar xz -C /usr/local/bin
+curl -L https://github.com/kateleext/perch/releases/download/v0.0.2/perch_linux_amd64.tar.gz | tar xz -C /usr/local/bin
 ```
 
 ## Usage
