@@ -39,6 +39,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Check if this is a dev build
+	if os.Getenv("PERCH_DEV") == "1" {
+		ui.DevBuild = true
+	}
+
 	// Create and run the TUI
 	p := tea.NewProgram(
 		ui.New(absDir),

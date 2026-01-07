@@ -18,6 +18,16 @@ import (
 	"github.com/kateleext/perch/internal/git"
 )
 
+// DevBuild indicates if this is a development build
+var DevBuild = false
+
+// ANSI background codes for diff lines
+const (
+	bgAddANSI = "\033[48;2;18;40;18m" // #122812 - darker green
+	bgDelANSI = "\033[48;2;45;18;18m" // #2d1212 - darker red
+	ansiReset = "\033[0m"
+)
+
 // Styles
 var (
 	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
@@ -25,8 +35,8 @@ var (
 	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("109"))
 	dividerStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	keyStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-	lineAddStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("71"))
-	lineDelStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("167"))
+	lineAddGutter = lipgloss.NewStyle().Foreground(lipgloss.Color("#5a8a5a")) // muted green, blends with bg
+	lineDelGutter = lipgloss.NewStyle().Foreground(lipgloss.Color("#8a5a5a")) // muted red, blends with bg
 	blueStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))  // Subtle blue for sparkle
 	blueDimStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("67"))  // Dimmer blue for sparkle off
 )
@@ -36,12 +46,31 @@ type TickMsg time.Time
 
 // PreviewContent holds the rendered preview data for a specific file
 type PreviewContent struct {
-	Valid           bool
-	Message         string
-	RawLines        []string
+	Valid            bool
+	Message          string
+	RawLines         []string
 	HighlightedLines []string
-	DiffLines       map[int]string
-	DiffStats       git.DiffStats
+	DiffLines        map[int]string
+	DiffStats        git.DiffStats
+	WrappedByWidth   map[int][]VisualLine
+}
+
+// ResetWrapCache clears the cached wrapped lines
+func (pc *PreviewContent) ResetWrapCache() {
+	pc.WrappedByWidth = make(map[int][]VisualLine)
+}
+
+// WrappedLinesForWidth returns wrapped lines for a given width, using cache
+func (pc *PreviewContent) WrappedLinesForWidth(width int) []VisualLine {
+	if pc.WrappedByWidth == nil {
+		pc.WrappedByWidth = make(map[int][]VisualLine)
+	}
+	if lines, ok := pc.WrappedByWidth[width]; ok {
+		return lines
+	}
+	lines := wrapAllLines(pc.HighlightedLines, pc.RawLines, pc.DiffLines, width)
+	pc.WrappedByWidth[width] = lines
+	return lines
 }
 
 // Model is the main bubbletea model
@@ -60,18 +89,21 @@ type Model struct {
 	viewport         viewport.Model
 	sparkleOn        bool
 	loading          bool // true until first filesLoadedMsg
+	loadingFrame     int  // track animation frame for loading screen
+	loadingStartTime time.Time // track when loading started
 }
 
 // New creates a new UI model
 func New(dir string) Model {
 	gitRoot, _ := git.GetGitRoot(dir)
 	return Model{
-		dir:        dir,
-		gitRoot:    gitRoot,
-		listHeight: 8,
-		preview:    PreviewContent{},
-		viewport:   viewport.New(80, 10),
-		loading:    true, // Start in loading state
+		dir:              dir,
+		gitRoot:          gitRoot,
+		listHeight:       8,
+		preview:          PreviewContent{},
+		viewport:         viewport.New(80, 10),
+		loading:          true, // Start in loading state
+		loadingStartTime: time.Now(),
 	}
 }
 
@@ -177,7 +209,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.recalculateViewport()
 
 	case filesLoadedMsg:
-		m.loading = false
+		// Enforce minimum 3 second loading screen
+		if time.Since(m.loadingStartTime) < 3*time.Second {
+			m.loading = true
+		} else {
+			m.loading = false
+		}
 		
 		// Remember if we were at the top file
 		wasAtTop := m.selected == 0
@@ -226,6 +263,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case TickMsg:
 		m.sparkleOn = !m.sparkleOn
+		// Increment animation frame during loading
+		if m.loading {
+			m.loadingFrame++
+		}
 		// Refresh files and diffs every tick
 		return m, tea.Batch(tickCmd(), m.loadFiles)
 	}
@@ -336,14 +377,13 @@ func (m *Model) updatePreviewKeepScroll(keepScroll bool) {
 	m.lastSelectedFile = m.selected
 }
 
-// renderPreviewContent builds the content string for the viewport
+// renderPreviewContent builds the content string for the viewport using wrapped lines
 func (m *Model) renderPreviewContent() string {
 	if !m.preview.Valid {
 		return ""
 	}
 
 	if m.preview.Message != "" {
-		// Center the message in the viewport
 		lines := strings.Split(m.preview.Message, "\n")
 		var centered []string
 		for _, line := range lines {
@@ -353,7 +393,6 @@ func (m *Model) renderPreviewContent() string {
 			}
 			centered = append(centered, strings.Repeat(" ", padLeft)+dimStyle.Render(line))
 		}
-		// Add vertical padding
 		vertPad := (m.viewport.Height - len(centered)) / 2
 		if vertPad < 0 {
 			vertPad = 0
@@ -362,52 +401,62 @@ func (m *Model) renderPreviewContent() string {
 		return result
 	}
 
-	if len(m.preview.RawLines) == 0 {
+	if len(m.preview.HighlightedLines) == 0 {
 		return ""
 	}
 
+	wrappedLines := m.preview.WrappedLinesForWidth(m.width)
+
 	var b strings.Builder
-	maxLineLen := m.width - 6
-	if maxLineLen < 20 {
-		maxLineLen = 20
-	}
-
-	for i := range m.preview.RawLines {
-		lineNum := i + 1
-
-		// Get raw content
-		rawContent := m.preview.RawLines[i]
-		if len(rawContent) > maxLineLen {
-			rawContent = rawContent[:maxLineLen-3] + "..."
-		}
-
-		// Check if this is a diff line
-		status, isDiff := m.preview.DiffLines[lineNum]
-
-		// Build gutter and content based on diff status
+	for i, vl := range wrappedLines {
 		var gutter string
-		var content string
-		if isDiff {
-			// Diff lines: colored gutter and colored content
-			if status == "added" {
-				gutter = "  " + lineAddStyle.Render("+") + " "
-				content = lineAddStyle.Render(rawContent)
-			} else {
-				gutter = "  " + lineDelStyle.Render("-") + " "
-				content = lineDelStyle.Render(rawContent)
-			}
-		} else {
-			// Normal lines: dim gutter, syntax highlighted content
-			gutter = "  " + dimStyle.Render("·") + " "
-			if i < len(m.preview.HighlightedLines) && m.preview.HighlightedLines[i] != "" {
-				content = m.preview.HighlightedLines[i]
-			} else {
-				content = rawContent
-			}
+		var bgCode string
+
+		switch vl.DiffStatus {
+		case "added":
+			gutter = "  " + lineAddGutter.Render(vl.Gutter)
+			bgCode = bgAddANSI
+		case "deleted":
+			gutter = "  " + lineDelGutter.Render(vl.Gutter)
+			bgCode = bgDelANSI
+		default:
+			gutter = "  " + dimStyle.Render(vl.Gutter)
 		}
 
-		b.WriteString(gutter + content)
-		if i < len(m.preview.RawLines)-1 {
+		// Calculate visible width BEFORE any background injection
+		// gutter: "  " (2) + vl.Gutter (2, e.g. "+ ") = 4 visible chars
+		// We use a fixed gutter width since it's always the same structure
+		const gutterVisibleWidth = 4
+		textWidth := VisibleWidth(vl.Text)
+		totalWidth := gutterVisibleWidth + textWidth
+		padding := m.width - totalWidth
+		if padding < 0 {
+			padding = 0
+		}
+
+		// Inject background into both gutter and content so it survives ANSI resets
+		text := vl.Text
+		if bgCode != "" {
+			gutter = InjectBackground(gutter, bgCode)
+			text = InjectBackground(vl.Text, bgCode)
+		}
+
+		// Build final line - for diff lines, wrap everything in background
+		if bgCode != "" {
+			// Start with background, write content, add padding, then reset
+			// This ensures background extends fully regardless of ANSI codes in content
+			b.WriteString(bgCode)
+			b.WriteString(gutter)
+			b.WriteString(text)
+			b.WriteString(strings.Repeat(" ", padding))
+			b.WriteString(ansiReset)
+		} else {
+			b.WriteString(gutter)
+			b.WriteString(text)
+			b.WriteString(strings.Repeat(" ", padding))
+		}
+
+		if i < len(wrappedLines)-1 {
 			b.WriteString("\n")
 		}
 	}
@@ -470,12 +519,13 @@ func highlightCode(content, filename string) []string {
 			continue
 		}
 
-		// Clean up: trim trailing newline and ensure ANSI reset at end
-		highlighted := strings.TrimSuffix(buf.String(), "\n")
-		// Add reset sequence to prevent color bleed
-		if !strings.HasSuffix(highlighted, "\033[0m") {
-			highlighted += "\033[0m"
-		}
+		// Clean up: remove any embedded newlines and ensure ANSI reset at end
+		highlighted := buf.String()
+		// Remove trailing reset, strip newlines, then add reset back
+		highlighted = strings.TrimSuffix(highlighted, "\033[0m")
+		highlighted = strings.TrimSuffix(highlighted, "\n")
+		highlighted = strings.ReplaceAll(highlighted, "\n", "") // remove any embedded newlines
+		highlighted += "\033[0m"
 		highlightedLines[i] = highlighted
 	}
 
@@ -548,7 +598,11 @@ func (m Model) renderFileList() string {
 		sparkle = blueDimStyle.Render("✧")
 	}
 	shortPath := truncatePath(m.dir, 2)
-	header := " " + sparkle + " " + dimStyle.Render("LATEST PROGRESS") + "  " + dimStyle.Render("↑↓")
+	devMarker := ""
+	if DevBuild {
+		devMarker = dimStyle.Render("[dev] ")
+	}
+	header := devMarker + sparkle + " " + dimStyle.Render("LATEST PROGRESS") + "  " + dimStyle.Render("↑↓")
 	pathHint := dimStyle.Render("perched on ") + dimStyle.Render(shortPath)
 	lines = append(lines, padLine(header, pathHint, m.width))
 
@@ -689,20 +743,34 @@ func (m Model) renderLoadingScreen() string {
 		lines = append(lines, "")
 	}
 	
-	// Art (centered)
+	// Art (centered) with fade-in animation
 	artWidth := 53
 	padLeft := (m.width - artWidth) / 2
 	if padLeft < 0 {
 		padLeft = 0
 	}
+	
+	// Calculate opacity based on animation frame (0-10)
+	opacity := m.loadingFrame
+	if opacity > 10 {
+		opacity = 10
+	}
+	
 	for _, line := range art {
-		lines = append(lines, strings.Repeat(" ", padLeft)+dimStyle.Render(line))
+		renderedLine := strings.Repeat(" ", padLeft) + line
+		// Apply fade-in by adjusting opacity
+		if opacity < 10 {
+			renderedLine = strings.Repeat(" ", padLeft) + dimStyle.Render(line)
+		} else {
+			renderedLine = strings.Repeat(" ", padLeft) + line
+		}
+		lines = append(lines, renderedLine)
 	}
 	
 	lines = append(lines, "") // gap
 	
 	// Title
-	title := "STAY PERCHED"
+	title := "keeping an eye on the progress..."
 	titlePad := (m.width - len(title)) / 2
 	if titlePad < 0 {
 		titlePad = 0

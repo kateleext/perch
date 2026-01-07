@@ -2,4 +2,4 @@
 # Quick dev runner - run from anywhere
 PERCH_DIR="/Users/kate/Projects/takuma-os/labs/fun/perch"
 TARGET="${1:-$(pwd)}"
-cd "$PERCH_DIR" && go build -o /tmp/perch-dev-bin ./cmd/perch && /tmp/perch-dev-bin "$TARGET"
+cd "$PERCH_DIR" && go build -o /tmp/perch-dev-bin ./cmd/perch && PERCH_DEV=1 /tmp/perch-dev-bin "$TARGET"
