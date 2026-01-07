@@ -4,6 +4,7 @@
 
 <img width="498" height="340" alt="image" src="https://github.com/user-attachments/assets/83b36a4f-7f35-4ff5-b3c1-60602f20d4f6" />
 
+<hr>
 Agent TUIs are already information-dense with diffs flying all over the screen. I found myself yearning for something minimal. Read-only. Single-purpose. Just shows what files are being worked on so I feel just enough control to not feel like leaving the terminal. 
 
 Perch shows the most recent changes in any git directory. Whatever your agent(s) just touched appears at the top. File preview with syntax highlighting shows diffs inline, read-only. 
