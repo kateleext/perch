@@ -1,0 +1,54 @@
+version: 2
+project_name: perch
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: perch
+    main: ./cmd/perch
+    binary: perch
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}}
+
+archives:
+  - id: default
+    name_template: '{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}'
+    format: tar.gz
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+release:
+  github:
+    owner: kateleext
+    name: perch
+
+brews:
+  - name: perch
+    repository:
+      owner: kateleext
+      name: homebrew-tap
+    directory: Formula
+    homepage: https://github.com/kateleext/perch
+    description: Minimal file viewer for coding agents
+    license: MIT
+    install: |
+      bin.install "perch"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
