@@ -812,17 +812,21 @@ func (m Model) renderPreviewWithIndicators() string {
 	visibleEnd := m.viewport.YOffset + m.viewport.Height
 	showBottomDots := visibleEnd < totalContentLines
 
-	// Top indicator
+	// Top indicator (or empty line to maintain layout)
 	if showTopDots {
 		lines = append(lines, cyanStyle.Render("  ..."))
+	} else {
+		lines = append(lines, "") // Empty line to maintain layout
 	}
 
 	// Main viewport content
 	lines = append(lines, m.viewport.View())
 
-	// Bottom indicator
+	// Bottom indicator (or empty line to maintain layout)
 	if showBottomDots {
 		lines = append(lines, cyanStyle.Render("  ..."))
+	} else {
+		lines = append(lines, "") // Empty line to maintain layout
 	}
 
 	return strings.Join(lines, "\n") + "\n"
