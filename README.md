@@ -66,3 +66,6 @@ Run it in a split pane. It refreshes every 2 seconds.
 ---
 
 v0.1 is a proof of concept for my own workflow. Contributions welcome.
+# Test
+
+New line added

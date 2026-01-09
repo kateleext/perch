@@ -276,7 +276,14 @@ func wrapAllLines(highlighted []string, rawLines []string, diffLines map[int]str
 			rawLine = rawLines[i]
 		}
 
-		wrapped := wrapHighlightedLine(line, i, maxWidth, diffStatus, rawLine)
+		// If highlighted line is empty but raw line has content (e.g., markdown
+		// code fences, table rows), use raw line so diff highlighting is visible
+		displayLine := line
+		if displayLine == "" && rawLine != "" {
+			displayLine = rawLine
+		}
+
+		wrapped := wrapHighlightedLine(displayLine, i, maxWidth, diffStatus, rawLine)
 		result = append(result, wrapped...)
 	}
 
