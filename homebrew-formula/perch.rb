@@ -4,9 +4,6 @@ class Perch < Formula
   version "0.0.4"
   license "MIT"
 
-  # Pre-built binaries only, no source needed
-  bottle :unneeded
-
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/kateleext/perch/releases/download/v0.0.4/perch_darwin_arm64.tar.gz"
