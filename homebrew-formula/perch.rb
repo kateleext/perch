@@ -1,7 +1,7 @@
 class Perch < Formula
   desc "Minimal file viewer for coding agents"
   homepage "https://github.com/kateleext/perch"
-  version "0.0.1"
+  version "0.0.4"
   license "MIT"
 
   # Pre-built binaries only, no source needed
@@ -9,23 +9,23 @@ class Perch < Formula
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/kateleext/perch/releases/download/v0.0.1/perch_darwin_arm64.tar.gz"
-      sha256 "98b4c068e76b39f7b1382818644f3c9307dd4fd6da07357264100bebebaa5229"
+      url "https://github.com/kateleext/perch/releases/download/v0.0.4/perch_darwin_arm64.tar.gz"
+      sha256 "0281a807d8a8d4334a2bd9d69634a12863e19b46639ecfb39a70fbff328793ba"
     end
     if Hardware::CPU.intel?
-      url "https://github.com/kateleext/perch/releases/download/v0.0.1/perch_darwin_amd64.tar.gz"
-      sha256 "a5211a087eba931e74b056b0c98bd030c908bdabf9497a0daf1f590b2cca0301"
+      url "https://github.com/kateleext/perch/releases/download/v0.0.4/perch_darwin_amd64.tar.gz"
+      sha256 "8f196ea5795ca95f5f273e10110be8be222089ccfcaa59060794bee50b3f9d35"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
-      url "https://github.com/kateleext/perch/releases/download/v0.0.1/perch_linux_arm64.tar.gz"
-      sha256 "ff530d6cf0fa1f2cc1851752cbb91624e9c66b22c1a84a569d46acaca21d1adc"
+      url "https://github.com/kateleext/perch/releases/download/v0.0.4/perch_linux_arm64.tar.gz"
+      sha256 "21593a52d2bd4d8d692d7b8d06ef4403c18f515c22612e115ed9d9c5fb2c7b1b"
     end
     if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
-      url "https://github.com/kateleext/perch/releases/download/v0.0.1/perch_linux_amd64.tar.gz"
-      sha256 "b0cbf39d37f2c2e5935bafdb898614f21e7b2aa6c232a1d75411cd851e1c620d"
+      url "https://github.com/kateleext/perch/releases/download/v0.0.4/perch_linux_amd64.tar.gz"
+      sha256 "221a8e69ca4ecdbe5a90b344907b9a706092c587da863126d3cbe9d2dc710bdd"
     end
   end
 
