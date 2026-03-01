@@ -22,7 +22,7 @@ import (
 var DevBuild = false
 
 // Version is the current version of perch
-var Version = "0.0.3"
+var Version = "0.0.4"
 
 // ANSI codes for diff lines
 const (

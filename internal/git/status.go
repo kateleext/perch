@@ -219,11 +219,8 @@ func GetStatus(dir string) ([]FileStatus, error) {
 		}
 	}
 
-	// Get recently committed files
-	committed, err := getRecentlyCommitted(gitRoot, relPrefix, gitRoot)
-	if err != nil {
-		return nil, err
-	}
+	// Get recently committed files (may fail on repos with no commits yet)
+	committed, _ := getRecentlyCommitted(gitRoot, relPrefix, gitRoot)
 	for _, f := range committed {
 		if !seen[f.Path] {
 			files = append(files, f)
