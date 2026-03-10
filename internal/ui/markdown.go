@@ -204,7 +204,7 @@ func highlightCodeFenceLine(line, lang string) string {
 	}
 	lexer = chroma.Coalesce(lexer)
 
-	styleName := "algol"
+	styleName := "monokai"
 	style := styles.Get(styleName)
 	if style == nil {
 		style = styles.Fallback

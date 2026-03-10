@@ -177,13 +177,26 @@ func sliceANSIAware(s string, maxWidth int) (content string, remainder string, a
 	return content, remainder, activeANSI
 }
 
+// isTableLine checks if a raw line is a markdown/rendered table row that shouldn't wrap
+func isTableLine(rawLine string) bool {
+	trimmed := strings.TrimSpace(rawLine)
+	// Markdown table row: starts/contains pipes
+	if strings.Contains(trimmed, "|") {
+		return true
+	}
+	// Rendered table with box-drawing characters
+	if strings.ContainsAny(trimmed, "│┼─╭╮╰╯├┤┬┴") {
+		return true
+	}
+	return false
+}
+
 // wrapHighlightedLine splits one highlighted line into VisualLine segments
 // with hanging indent support - continuation lines preserve leading whitespace
 func wrapHighlightedLine(line string, logicalIndex int, maxWidth int, diffStatus string, rawLine string) []VisualLine {
 	if maxWidth <= gutterWidth {
 		maxWidth = gutterWidth + 10
 	}
-	contentWidth := maxWidth - gutterWidth
 
 	// Determine gutter symbol based on diff status
 	var firstGutter string
@@ -195,6 +208,19 @@ func wrapHighlightedLine(line string, logicalIndex int, maxWidth int, diffStatus
 	default:
 		firstGutter = "· "
 	}
+
+	// Table lines: don't wrap, return as single line
+	if isTableLine(rawLine) {
+		return []VisualLine{{
+			LogicalIndex: logicalIndex,
+			SegmentIndex: 0,
+			Gutter:       firstGutter,
+			Text:         line,
+			DiffStatus:   diffStatus,
+		}}
+	}
+
+	contentWidth := maxWidth - gutterWidth
 	contGutter := "  "
 
 	// Calculate hanging indent from raw line's leading whitespace

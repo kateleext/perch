@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -28,14 +27,6 @@ func main() {
 	info, err := os.Stat(absDir)
 	if err != nil || !info.IsDir() {
 		fmt.Printf("Not a valid directory: %s\n", absDir)
-		os.Exit(1)
-	}
-
-	// Check if it's a git repo
-	cmd := exec.Command("git", "rev-parse", "--git-dir")
-	cmd.Dir = absDir
-	if err := cmd.Run(); err != nil {
-		fmt.Printf("Not a git repository: %s\n", absDir)
 		os.Exit(1)
 	}
 

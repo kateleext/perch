@@ -1,19 +1,18 @@
 # PERCH
 
-**Minimal file viewer that stays perched on your agents' progress.**
+A file viewer for your terminal. Point it at any directory, see what changed, preview everything.
 
 <img width="498" height="340" alt="image" src="https://github.com/user-attachments/assets/83b36a4f-7f35-4ff5-b3c1-60602f20d4f6" />
 
-<hr>
-Agent TUIs are already information-dense with diffs flying all over the screen. I found myself yearning for something minimal. Read-only. Single-purpose. Just shows what files are being worked on so I feel just enough control to not feel like leaving the terminal. 
-<br><br>
+Built for watching coding agents work, but useful anywhere you want a quick read-only view of files sorted by what changed most recently.
 
-Perch shows the most recent changes in any git directory. Whatever your agent(s) just touched appears at the top. File preview with syntax highlighting shows diffs inline, read-only. 
-<br><br>
+## What it does
 
-*That's it.*
-
-<hr>
+- Shows files sorted by most recent changes (git-aware or plain filesystem)
+- Syntax-highlighted preview with inline diffs
+- Previews Office docs (docx, pptx, xlsx), PDFs, images, and zip archives
+- Works in git repos and regular directories
+- Refreshes every 2 seconds
 
 ## Install
 
@@ -28,44 +27,47 @@ brew install perch
 go install github.com/kateleext/perch/cmd/perch@latest
 ```
 
-**Direct:**
+**Direct download:**
 ```
 # macOS arm64 (Apple Silicon)
-curl -L https://github.com/kateleext/perch/releases/download/v0.0.2/perch_darwin_arm64.tar.gz | tar xz -C /usr/local/bin
+curl -L https://github.com/kateleext/perch/releases/download/v0.0.5/perch_darwin_arm64.tar.gz | tar xz -C /usr/local/bin
 
 # macOS x86_64 (Intel)
-curl -L https://github.com/kateleext/perch/releases/download/v0.0.2/perch_darwin_amd64.tar.gz | tar xz -C /usr/local/bin
+curl -L https://github.com/kateleext/perch/releases/download/v0.0.5/perch_darwin_amd64.tar.gz | tar xz -C /usr/local/bin
 
 # Linux arm64
-curl -L https://github.com/kateleext/perch/releases/download/v0.0.2/perch_linux_arm64.tar.gz | tar xz -C /usr/local/bin
+curl -L https://github.com/kateleext/perch/releases/download/v0.0.5/perch_linux_arm64.tar.gz | tar xz -C /usr/local/bin
 
 # Linux x86_64
-curl -L https://github.com/kateleext/perch/releases/download/v0.0.2/perch_linux_amd64.tar.gz | tar xz -C /usr/local/bin
+curl -L https://github.com/kateleext/perch/releases/download/v0.0.5/perch_linux_amd64.tar.gz | tar xz -C /usr/local/bin
 ```
 
 ## Usage
 
 ```
-# Run in current directory
-perch
-
-# Watch a specific directory
-perch /path/to/repo
+perch              # current directory
+perch /some/path   # any directory
 ```
 
-Run it in a split pane. It refreshes every 2 seconds.
+Run it in a split pane next to your editor or agent.
 
 | Key | Action |
 |-----|--------|
-| `↑↓` | Navigate files |
+| `up/down` | Navigate files |
 | `j/k` | Scroll preview |
-| `g/G` | Top/bottom |
+| `h/l` | Pan wide content left/right |
+| `g/G` | Jump to top/bottom |
+| `c` | Copy file content |
+| `p` | Copy file path |
+| `+/-` | Resize file list |
 | `q` | Quit |
-| `shift` + select | Copy text |
 
----
+## File support
 
-v0.1 is a proof of concept for my own workflow. Contributions welcome.
-# Test
+**Full preview:** Any text file with syntax highlighting (100+ languages), Markdown with styled headings/tables/code blocks
 
-New line added
+**Office docs:** Word (.docx) with heading hierarchy, PowerPoint (.pptx) with slide dividers, Excel (.xlsx) as rainbow-colored tables, OpenDocument formats
+
+**Other:** PDF text extraction, image preview (half-block rendering), zip archive contents
+
+Files it can't preview get a clean placeholder instead of garbled output.

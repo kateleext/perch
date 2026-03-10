@@ -33,7 +33,10 @@ type FileStatus struct {
 // ChangeType returns a human-readable description of the change
 func (f FileStatus) ChangeType() string {
 	if f.Status == "committed" {
-		return f.TimeAgo + " · " + f.Commit
+		if f.Commit != "" {
+			return f.TimeAgo + " · " + f.Commit
+		}
+		return f.TimeAgo
 	}
 
 	// Parse git status code
@@ -182,8 +185,20 @@ func GetSubmodules(dir string) []string {
 	return submodules
 }
 
-// GetStatus returns files from git status and recent commits
+// IsGitRepo returns true if dir is inside a git repository
+func IsGitRepo(dir string) bool {
+	cmd := exec.Command("git", "rev-parse", "--git-dir")
+	cmd.Dir = dir
+	return cmd.Run() == nil
+}
+
+// GetStatus returns files from git status and recent commits.
+// Falls back to filesystem walk if not a git repo.
 func GetStatus(dir string) ([]FileStatus, error) {
+	if !IsGitRepo(dir) {
+		return GetFilesNoGit(dir)
+	}
+
 	var files []FileStatus
 	seen := make(map[string]bool)
 
@@ -424,6 +439,88 @@ func getNestedRepoFiles(repoPath, targetDir string) ([]FileStatus, error) {
 	}
 
 	return files, nil
+}
+
+// GetFilesNoGit walks a directory and returns files sorted by modification time.
+// Used as fallback when the directory is not a git repository.
+func GetFilesNoGit(dir string) ([]FileStatus, error) {
+	var files []FileStatus
+
+	ignoreDirs := map[string]bool{
+		"node_modules": true, ".next": true, "vendor": true,
+		"__pycache__": true, ".cache": true, "tmp": true, "build": true,
+		"dist": true, ".bundle": true, ".terraform": true,
+	}
+
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return filepath.SkipDir
+		}
+		if info.IsDir() {
+			name := info.Name()
+			if strings.HasPrefix(name, ".") || ignoreDirs[name] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if shouldSkipFile(path) {
+			return nil
+		}
+
+		relPath, _ := filepath.Rel(dir, path)
+		files = append(files, FileStatus{
+			Status:   "committed",
+			Path:     relPath,
+			FullPath: relPath,
+			IsFile:   true,
+			ModTime:  info.ModTime(),
+			TimeAgo:  formatTimeAgo(info.ModTime()),
+		})
+		return nil
+	})
+
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].ModTime.After(files[j].ModTime)
+	})
+
+	// Limit to 50 most recently modified
+	if len(files) > 50 {
+		files = files[:50]
+	}
+
+	return files, nil
+}
+
+func formatTimeAgo(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		m := int(d.Minutes())
+		if m == 1 {
+			return "1 minute ago"
+		}
+		return fmt.Sprintf("%d minutes ago", m)
+	case d < 24*time.Hour:
+		h := int(d.Hours())
+		if h == 1 {
+			return "1 hour ago"
+		}
+		return fmt.Sprintf("%d hours ago", h)
+	case d < 7*24*time.Hour:
+		days := int(d.Hours() / 24)
+		if days == 1 {
+			return "1 day ago"
+		}
+		return fmt.Sprintf("%d days ago", days)
+	default:
+		weeks := int(d.Hours() / 24 / 7)
+		if weeks == 1 {
+			return "1 week ago"
+		}
+		return fmt.Sprintf("%d weeks ago", weeks)
+	}
 }
 
 func getUncommitted(gitRoot, prefix, fileGitRoot string) ([]FileStatus, error) {

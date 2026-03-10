@@ -1,12 +1,27 @@
 package ui
 
 import (
+	"archive/zip"
 	"bytes"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"image"
+	"image/color"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+
+	gopdf "github.com/ledongthuc/pdf"
 
 	"github.com/alecthomas/chroma/v2"
 	"github.com/alecthomas/chroma/v2/formatters"
@@ -82,13 +97,18 @@ type previewRequestMsg struct {
 // previewLoadedMsg carries the async-loaded preview content
 type previewLoadedMsg struct {
 	selectedIndex int
+	gen           uint64 // generation when this load was started
 	preview       PreviewContent
 }
+
+// flashClearMsg signals that the flash message should be cleared
+type flashClearMsg struct{}
 
 // PreviewContent holds the rendered preview data for a specific file
 type PreviewContent struct {
 	Valid            bool
 	Message          string
+	ImageRender      string // raw terminal output for image preview (bypass viewport)
 	RawLines         []string
 	HighlightedLines []string
 	DiffLines        map[int]string
@@ -132,8 +152,12 @@ type Model struct {
 	loading          bool // true until first filesLoadedMsg
 	loadingFrame     int  // track animation frame for loading screen
 	loadingStartTime time.Time // track when loading started
-	previewPending   int  // index of pending preview request (-1 = none)
+	previewPending   int    // index of pending preview request (-1 = none)
+	previewGen       uint64 // generation counter — incremented on each selection change
 	previewCache     map[string]PreviewContent // cache by file path
+	xOffset          int  // horizontal scroll offset for wide content
+	flashMsg         string    // temporary status message
+	flashExpiry      time.Time // when to clear flash
 }
 
 // New creates a new UI model
@@ -163,7 +187,7 @@ func tickCmd() tea.Cmd {
 
 // debouncePreviewCmd waits briefly then signals to load the preview
 func debouncePreviewCmd(selectedIndex int) tea.Cmd {
-	return tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg {
+	return tea.Tick(120*time.Millisecond, func(t time.Time) tea.Msg {
 		return previewRequestMsg{selectedIndex: selectedIndex}
 	})
 }
@@ -201,7 +225,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.listScroll = 0
 					}
 				}
+				m.previewGen++
 				m.previewPending = m.selected
+				m.lastSelectedFile = -1 // invalidate so header updates
 				cmds = append(cmds, debouncePreviewCmd(m.selected))
 			}
 		case "down":
@@ -218,13 +244,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.selected >= m.listScroll+visibleCapacity-bottomBuffer {
 					m.listScroll = m.selected - visibleCapacity + bottomBuffer + 1
 				}
+				m.previewGen++
 				m.previewPending = m.selected
+				m.lastSelectedFile = -1
 				cmds = append(cmds, debouncePreviewCmd(m.selected))
 			}
 		case "j":
 			m.viewport.LineDown(1)
 		case "k":
 			m.viewport.LineUp(1)
+		case "h", "left":
+			if m.xOffset > 0 {
+				m.xOffset -= 4
+				if m.xOffset < 0 {
+					m.xOffset = 0
+				}
+				m.viewport.SetContent(m.renderPreviewContent())
+			}
+		case "l", "right":
+			m.xOffset += 4
+			m.viewport.SetContent(m.renderPreviewContent())
+		case "c":
+			if text := m.getPreviewText(); text != "" {
+				if copyToClipboard(text) == nil {
+					m.flashMsg = "copied content"
+					m.flashExpiry = time.Now().Add(2 * time.Second)
+					cmds = append(cmds, clearFlashAfter(2*time.Second))
+				}
+			}
+		case "p":
+			if m.selected >= 0 && m.selected < len(m.files) {
+				file := m.files[m.selected]
+				fullPath := filepath.Join(m.dir, file.Path)
+				if copyToClipboard(fullPath) == nil {
+					m.flashMsg = "copied path"
+					m.flashExpiry = time.Now().Add(2 * time.Second)
+					cmds = append(cmds, clearFlashAfter(2*time.Second))
+				}
+			}
 		case "g":
 			m.viewport.GotoTop()
 		case "G":
@@ -248,7 +305,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.selected != 0 {
 				m.selected = 0
 				m.listScroll = 0
+				m.previewGen++
 				m.previewPending = m.selected
+				m.lastSelectedFile = -1
 				cmds = append(cmds, debouncePreviewCmd(m.selected))
 			}
 		}
@@ -349,12 +408,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Load async
 		return m, m.loadPreviewAsync(msg.selectedIndex)
 
+	case flashClearMsg:
+		if time.Now().After(m.flashExpiry) {
+			m.flashMsg = ""
+		}
+		return m, nil
+
 	case previewLoadedMsg:
-		// Only apply if still relevant
-		if msg.selectedIndex != m.selected {
+		// Only apply if still relevant (check both index and generation)
+		if msg.selectedIndex != m.selected || msg.gen != m.previewGen {
 			return m, nil
 		}
 		m.preview = msg.preview
+		m.xOffset = 0
 		// Cache committed file previews
 		if msg.selectedIndex < len(m.files) {
 			file := m.files[msg.selectedIndex]
@@ -389,6 +455,9 @@ func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
 	file := m.files[selectedIndex]
 	dir := m.dir
 	gitRoot := m.gitRoot
+	gen := m.previewGen
+	viewWidth := m.width
+	viewHeight := m.viewport.Height
 	if file.GitRoot != "" {
 		gitRoot = file.GitRoot
 	}
@@ -400,19 +469,94 @@ func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
 		if strings.Contains(file.GitCode, "D") {
 			return previewLoadedMsg{
 				selectedIndex: selectedIndex,
+				gen:           gen,
 				preview:       PreviewContent{Valid: true, Message: fmt.Sprintf("%s was deleted", file.Path)},
 			}
 		}
 
-		// Check if file type is unsupported
-		if isUnsupportedFile(file.Path) {
-			reason := "not supported in perch"
-			if filepath.Ext(file.Path) == "" {
-				reason = "no file extension — open in your editor"
+		// Check if it's an image file
+		if isImageFile(file.Path) {
+			imgRender, msg := renderImagePreview(fullPath, viewWidth, viewHeight)
+			return previewLoadedMsg{
+				selectedIndex: selectedIndex,
+				gen:           gen,
+				preview:       PreviewContent{Valid: true, ImageRender: imgRender, Message: msg},
+			}
+		}
+
+		// Check if it's a zip-based file (docx, xlsx, pptx, zip, etc.)
+		if isZipBasedFile(file.Path) {
+			ext := strings.ToLower(filepath.Ext(file.Path))
+			// Docx/pptx: structured extraction with headings, wrapping, gutters
+			if ext == ".docx" || ext == ".pptx" || ext == ".odt" {
+				var rawLines, hlLines []string
+				switch ext {
+				case ".docx":
+					rawLines, hlLines = extractDocxStructured(fullPath)
+				case ".pptx":
+					rawLines, hlLines = extractPptxStructured(fullPath)
+				case ".odt":
+					rawLines, hlLines = extractOdtStructured(fullPath)
+				}
+				if len(rawLines) > 0 {
+					return previewLoadedMsg{
+						selectedIndex: selectedIndex,
+						gen:           gen,
+						preview: PreviewContent{
+							Valid:            true,
+							RawLines:         rawLines,
+							HighlightedLines: hlLines,
+							DiffLines:        make(map[int]string),
+						},
+					}
+				}
+			}
+			// xlsx/zip/etc: ImageRender (tables, raw ANSI)
+			text := renderZipPreview(fullPath)
+			return previewLoadedMsg{
+				selectedIndex: selectedIndex,
+				gen:           gen,
+				preview:       PreviewContent{Valid: true, ImageRender: text},
+			}
+		}
+
+		// Check if it's a PDF
+		if strings.ToLower(filepath.Ext(file.Path)) == ".pdf" {
+			rawLines, hlLines := extractPdfStructured(fullPath)
+			if len(rawLines) > 0 {
+				return previewLoadedMsg{
+					selectedIndex: selectedIndex,
+					gen:           gen,
+					preview: PreviewContent{
+						Valid:            true,
+						RawLines:         rawLines,
+						HighlightedLines: hlLines,
+						DiffLines:        make(map[int]string),
+					},
+				}
 			}
 			return previewLoadedMsg{
 				selectedIndex: selectedIndex,
-				preview:       PreviewContent{Valid: true, Message: fmt.Sprintf("%s\n%s", filepath.Base(file.Path), reason)},
+				gen:           gen,
+				preview:       PreviewContent{Valid: true, Message: filepath.Base(file.Path) + "\nPDF — no extractable text"},
+			}
+		}
+
+		// Check if file type is supported text
+		if !isSupportedTextFile(file.Path) {
+			info, _ := os.Stat(fullPath)
+			reason := "binary file — open in your editor"
+			if filepath.Ext(file.Path) == "" {
+				reason = "no file extension — open in your editor"
+			}
+			sizeHint := ""
+			if info != nil {
+				sizeHint = formatFileSize(info.Size()) + " · "
+			}
+			return previewLoadedMsg{
+				selectedIndex: selectedIndex,
+				gen:           gen,
+				preview:       PreviewContent{Valid: true, Message: fmt.Sprintf("%s\n%s%s", filepath.Base(file.Path), sizeHint, reason)},
 			}
 		}
 
@@ -432,6 +576,7 @@ func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
 		if err != nil {
 			return previewLoadedMsg{
 				selectedIndex: selectedIndex,
+				gen:           gen,
 				preview:       PreviewContent{Valid: true, Message: fmt.Sprintf("couldn't read %s", file.Path)},
 			}
 		}
@@ -452,6 +597,7 @@ func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
 
 		return previewLoadedMsg{
 			selectedIndex: selectedIndex,
+			gen:           gen,
 			preview: PreviewContent{
 				Valid:            true,
 				RawLines:         rawLines,
@@ -507,13 +653,92 @@ func (m *Model) updatePreviewKeepScroll(keepScroll bool) {
 		return
 	}
 
-	// Check if file type is unsupported
-	if isUnsupportedFile(file.Path) {
-		reason := "not supported in perch"
+	// Check if it's an image file
+	if isImageFile(file.Path) {
+		imgRender, msg := renderImagePreview(fullPath, m.width, m.viewport.Height)
+		m.preview = PreviewContent{Valid: true, ImageRender: imgRender, Message: msg}
+		m.viewport.SetContent(m.renderPreviewContent())
+		if !keepScroll {
+			m.viewport.GotoTop()
+		}
+		m.lastSelectedFile = m.selected
+		return
+	}
+
+	// Check if it's a zip-based file (docx, xlsx, pptx, zip, etc.)
+	if isZipBasedFile(file.Path) {
+		ext := strings.ToLower(filepath.Ext(file.Path))
+		if ext == ".docx" || ext == ".pptx" || ext == ".odt" {
+			var rawLines, hlLines []string
+			switch ext {
+			case ".docx":
+				rawLines, hlLines = extractDocxStructured(fullPath)
+			case ".pptx":
+				rawLines, hlLines = extractPptxStructured(fullPath)
+			case ".odt":
+				rawLines, hlLines = extractOdtStructured(fullPath)
+			}
+			if len(rawLines) > 0 {
+				m.preview = PreviewContent{
+					Valid:            true,
+					RawLines:         rawLines,
+					HighlightedLines: hlLines,
+					DiffLines:        make(map[int]string),
+				}
+				m.viewport.SetContent(m.renderPreviewContent())
+				if !keepScroll {
+					m.viewport.GotoTop()
+				}
+				m.lastSelectedFile = m.selected
+				return
+			}
+		}
+		text := renderZipPreview(fullPath)
+		m.preview = PreviewContent{
+			Valid:       true,
+			ImageRender: text,
+		}
+		m.viewport.SetContent(m.renderPreviewContent())
+		if !keepScroll {
+			m.viewport.GotoTop()
+		}
+		m.lastSelectedFile = m.selected
+		return
+	}
+
+	// Check if it's a PDF
+	if strings.ToLower(filepath.Ext(file.Path)) == ".pdf" {
+		rawLines, hlLines := extractPdfStructured(fullPath)
+		if len(rawLines) > 0 {
+			m.preview = PreviewContent{
+				Valid:            true,
+				RawLines:         rawLines,
+				HighlightedLines: hlLines,
+				DiffLines:        make(map[int]string),
+			}
+		} else {
+			m.preview = PreviewContent{Valid: true, Message: filepath.Base(file.Path) + "\nPDF — no extractable text"}
+		}
+		m.viewport.SetContent(m.renderPreviewContent())
+		if !keepScroll {
+			m.viewport.GotoTop()
+		}
+		m.lastSelectedFile = m.selected
+		return
+	}
+
+	// Check if file type is supported text
+	if !isSupportedTextFile(file.Path) {
+		info, _ := os.Stat(fullPath)
+		reason := "binary file — open in your editor"
 		if filepath.Ext(file.Path) == "" {
 			reason = "no file extension — open in your editor"
 		}
-		m.preview = PreviewContent{Valid: true, Message: fmt.Sprintf("%s\n%s", filepath.Base(file.Path), reason)}
+		sizeHint := ""
+		if info != nil {
+			sizeHint = formatFileSize(info.Size()) + " · "
+		}
+		m.preview = PreviewContent{Valid: true, Message: fmt.Sprintf("%s\n%s%s", filepath.Base(file.Path), sizeHint, reason)}
 		m.viewport.SetContent(m.renderPreviewContent())
 		if !keepScroll {
 			m.viewport.GotoTop()
@@ -584,6 +809,19 @@ func (m *Model) renderPreviewContent() string {
 		return ""
 	}
 
+	// ImageRender is raw terminal output — apply horizontal scroll if needed
+	if m.preview.ImageRender != "" {
+		if m.xOffset == 0 {
+			return m.preview.ImageRender
+		}
+		lines := strings.Split(m.preview.ImageRender, "\n")
+		shifted := make([]string, len(lines))
+		for i, line := range lines {
+			shifted[i] = ansiTrimLeft(line, m.xOffset)
+		}
+		return strings.Join(shifted, "\n")
+	}
+
 	if m.preview.Message != "" {
 		lines := strings.Split(m.preview.Message, "\n")
 		var centered []string
@@ -627,11 +865,20 @@ func (m *Model) renderPreviewContent() string {
 			gutter = "  " + lineDotStyle.Render(vl.Gutter)
 		}
 
+		// Apply horizontal scroll to wide lines (e.g. unwrapped table lines)
+		displayText := vl.Text
+		if m.xOffset > 0 {
+			textWidth := VisibleWidth(vl.Text)
+			if textWidth > m.width-gutterWidth {
+				displayText = ansiTrimLeft(vl.Text, m.xOffset)
+			}
+		}
+
 		// Calculate visible width BEFORE any background injection
 		// gutter: "  " (2) + vl.Gutter (2, e.g. "+ ") = 4 visible chars
 		// We use a fixed gutter width since it's always the same structure
 		const gutterVisibleWidth = 4
-		textWidth := VisibleWidth(vl.Text)
+		textWidth := VisibleWidth(displayText)
 		totalWidth := gutterVisibleWidth + textWidth
 		padding := m.width - totalWidth
 		if padding < 0 {
@@ -639,7 +886,7 @@ func (m *Model) renderPreviewContent() string {
 		}
 
 		// Inject background into both gutter and content so it survives ANSI resets
-		text := vl.Text
+		text := displayText
 		if bgCode != "" {
 			gutter = InjectBackground(gutter, bgCode)
 			// Apply foreground color to text (overrides syntax highlighting)
@@ -733,7 +980,7 @@ func highlightCode(content, filename string) []string {
 	}
 	lexer = chroma.Coalesce(lexer)
 
-	styleName := "algol"
+	styleName := "monokai"
 	style := styles.Get(styleName)
 	if style == nil {
 		style = styles.Fallback
@@ -779,27 +1026,1161 @@ func highlightCode(content, filename string) []string {
 	return highlightedLines
 }
 
-func isUnsupportedFile(path string) bool {
+// Supported text file extensions (whitelist approach)
+var supportedTextExtensions = map[string]bool{
+	// Programming languages
+	".go": true, ".py": true, ".rb": true, ".js": true, ".ts": true,
+	".jsx": true, ".tsx": true, ".rs": true, ".c": true, ".h": true,
+	".cpp": true, ".cc": true, ".cxx": true, ".hpp": true, ".hxx": true,
+	".java": true, ".kt": true, ".kts": true, ".swift": true,
+	".cs": true, ".fs": true, ".fsx": true,
+	".php": true, ".lua": true, ".r": true, ".m": true, ".mm": true,
+	".scala": true, ".clj": true, ".cljs": true, ".cljc": true,
+	".ex": true, ".exs": true, ".erl": true, ".hrl": true,
+	".hs": true, ".lhs": true, ".ml": true, ".mli": true,
+	".dart": true, ".zig": true, ".nim": true, ".v": true,
+	".d": true, ".pas": true, ".pp": true,
+	".pl": true, ".pm": true,
+	".sh": true, ".bash": true, ".zsh": true, ".fish": true,
+	".ps1": true, ".psm1": true, ".bat": true, ".cmd": true,
+	".groovy": true, ".gradle": true,
+	".vim": true, ".el": true, ".lisp": true, ".rkt": true,
+	".jl": true, ".cr": true, ".raku": true,
+	".awk": true, ".sed": true,
+	// Web
+	".html": true, ".htm": true, ".xhtml": true,
+	".css": true, ".scss": true, ".sass": true, ".less": true, ".styl": true,
+	".vue": true, ".svelte": true, ".astro": true,
+	// Data/Config
+	".json": true, ".jsonc": true, ".json5": true,
+	".yaml": true, ".yml": true,
+	".toml": true, ".xml": true, ".plist": true,
+	".ini": true, ".cfg": true, ".conf": true,
+	".env": true, ".properties": true,
+	// Markup/Docs
+	".md": true, ".markdown": true, ".mdown": true, ".mdx": true,
+	".txt": true, ".text": true, ".rst": true, ".tex": true, ".adoc": true,
+	".org": true,
+	// Templates
+	".erb": true, ".ejs": true, ".hbs": true, ".mustache": true,
+	".j2": true, ".jinja": true, ".jinja2": true,
+	".tmpl": true, ".tpl": true, ".liquid": true,
+	".haml": true, ".slim": true, ".pug": true, ".jade": true,
+	// Build
+	".cmake": true, ".gemspec": true, ".podspec": true,
+	// SQL
+	".sql": true,
+	// Other
+	".graphql": true, ".gql": true, ".proto": true,
+	".tf": true, ".hcl": true, ".nix": true,
+	".lock": true, ".sum": true, ".mod": true,
+	".csv": true, ".tsv": true,
+	".log": true, ".diff": true, ".patch": true,
+	".svg": true, // SVG is XML text
+	// Dotfile extensions
+	".gitignore": true, ".dockerignore": true, ".editorconfig": true,
+	".htaccess": true, ".npmrc": true, ".nvmrc": true, ".yarnrc": true,
+	".eslintrc": true, ".prettierrc": true, ".babelrc": true,
+	".ladder": true,
+}
+
+// Known text filenames without extensions
+var supportedFilenames = map[string]bool{
+	"makefile": true, "dockerfile": true, "gemfile": true,
+	"rakefile": true, "procfile": true, "vagrantfile": true,
+	"brewfile": true, "justfile": true, "taskfile": true,
+	"cmakelists.txt": true, "license": true, "readme": true,
+	"changelog": true, "authors": true, "contributors": true,
+	"copying": true, "todo": true,
+	".gitattributes": true, ".gitmodules": true,
+	".ruby-version": true, ".node-version": true, ".python-version": true,
+	".tool-versions": true,
+}
+
+func isSupportedTextFile(path string) bool {
+	base := strings.ToLower(filepath.Base(path))
+	if supportedFilenames[base] {
+		return true
+	}
+
 	ext := strings.ToLower(filepath.Ext(path))
 	if ext == "" {
-		return true
+		return false
 	}
-	unsupported := map[string]bool{
-		".xcuserstate": true, ".xcworkspace": true, ".pbxproj": true,
-		".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".ico": true, ".webp": true,
-		".exe": true, ".dll": true, ".so": true, ".dylib": true,
-		".zip": true, ".tar": true, ".gz": true, ".rar": true,
-		".mp3": true, ".mp4": true, ".wav": true, ".mov": true,
-		".ttf": true, ".otf": true, ".woff": true, ".woff2": true,
-		".pdf": true,
-	}
-	if unsupported[ext] {
-		return true
-	}
-	if strings.Contains(path, ".xcworkspace") || strings.Contains(path, ".xcodeproj") {
+
+	// Handle double extensions like .html.erb — check the last ext
+	return supportedTextExtensions[ext]
+}
+
+func isImageFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".ico":
 		return true
 	}
 	return false
+}
+
+// renderImagePreview renders an image as half-block characters for the viewport.
+// Each character cell = 2 vertical pixels using ▀ with fg=top, bg=bottom.
+// Returns (imageRender, message) — imageRender is raw ANSI for the viewport.
+func renderImagePreview(path string, viewWidth, viewHeight int) (imageRender string, message string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", renderImageFallback(path)
+	}
+	defer f.Close()
+
+	img, format, err := image.Decode(f)
+	if err != nil {
+		return "", renderImageFallback(path)
+	}
+
+	bounds := img.Bounds()
+	srcW := bounds.Dx()
+	srcH := bounds.Dy()
+
+	if srcW == 0 || srcH == 0 {
+		return "", renderImageFallback(path)
+	}
+
+	// Build info line
+	info, _ := os.Stat(path)
+	sizeStr := ""
+	if info != nil {
+		sizeStr = formatFileSize(info.Size()) + " · "
+	}
+	infoLine := fmt.Sprintf("%s  %s%dx%d · %s", filepath.Base(path), sizeStr, srcW, srcH, format)
+
+	return renderImageHalfBlocks(img, infoLine, viewWidth, viewHeight), ""
+}
+
+// renderImageHalfBlocks renders an image using half-block characters (▀).
+// Each character cell represents 2 vertical pixels with fg=top, bg=bottom.
+func renderImageHalfBlocks(img image.Image, infoLine string, viewWidth, viewHeight int) string {
+	bounds := img.Bounds()
+	srcW := bounds.Dx()
+	srcH := bounds.Dy()
+
+	// Calculate target size to fit viewport
+	maxCols := viewWidth - 6
+	maxRows := (viewHeight - 3) * 2 // each row of chars = 2 pixel rows
+	if maxCols < 10 {
+		maxCols = 10
+	}
+	if maxRows < 4 {
+		maxRows = 4
+	}
+
+	// Scale to fit, maintaining aspect ratio
+	scale := float64(maxCols) / float64(srcW)
+	if float64(srcH)*scale > float64(maxRows) {
+		scale = float64(maxRows) / float64(srcH)
+	}
+
+	dstW := int(float64(srcW) * scale)
+	dstH := int(float64(srcH) * scale)
+	if dstW < 1 {
+		dstW = 1
+	}
+	if dstH < 1 {
+		dstH = 1
+	}
+	// Ensure even height for half-block pairing
+	if dstH%2 != 0 {
+		dstH++
+	}
+
+	var b strings.Builder
+
+	// Center info line
+	infoPad := (viewWidth - len(infoLine)) / 2
+	if infoPad < 0 {
+		infoPad = 0
+	}
+	b.WriteString(strings.Repeat(" ", infoPad))
+	b.WriteString(dimStyle.Render(infoLine))
+	b.WriteString("\n\n")
+
+	// Center the image horizontally
+	imgPad := (viewWidth - dstW) / 2
+	if imgPad < 0 {
+		imgPad = 0
+	}
+	padStr := strings.Repeat(" ", imgPad)
+
+	for row := 0; row < dstH; row += 2 {
+		b.WriteString(padStr)
+		for col := 0; col < dstW; col++ {
+			// Map to source coordinates (nearest neighbor)
+			srcX := bounds.Min.X + col*srcW/dstW
+			srcY1 := bounds.Min.Y + row*srcH/dstH
+			srcY2 := bounds.Min.Y + (row+1)*srcH/dstH
+
+			r1, g1, b1 := colorToRGB(img.At(srcX, srcY1))
+			var r2, g2, b2 uint8
+			if row+1 < dstH {
+				r2, g2, b2 = colorToRGB(img.At(srcX, srcY2))
+			}
+
+			// ▀ with fg=top pixel, bg=bottom pixel
+			b.WriteString(fmt.Sprintf("\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm▀\033[0m",
+				r1, g1, b1, r2, g2, b2))
+		}
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
+func colorToRGB(c color.Color) (uint8, uint8, uint8) {
+	r, g, b, _ := c.RGBA()
+	return uint8(r >> 8), uint8(g >> 8), uint8(b >> 8)
+}
+
+func renderImageFallback(path string) string {
+	info, _ := os.Stat(path)
+	sizeStr := ""
+	if info != nil {
+		sizeStr = formatFileSize(info.Size()) + " · "
+	}
+	return fmt.Sprintf("%s\n%simage file", filepath.Base(path), sizeStr)
+}
+
+func formatFileSize(bytes int64) string {
+	switch {
+	case bytes < 1024:
+		return fmt.Sprintf("%d B", bytes)
+	case bytes < 1024*1024:
+		return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
+	default:
+		return fmt.Sprintf("%.1f MB", float64(bytes)/1024/1024)
+	}
+}
+
+// --- ZIP / Office document support ---
+
+// extractPdfStructured extracts text from a PDF, returning lines for RawLines/HighlightedLines.
+func extractPdfStructured(path string) (rawLines []string, highlightedLines []string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, nil
+	}
+
+	reader, err := gopdf.NewReader(f, info.Size())
+	if err != nil {
+		return nil, nil
+	}
+
+	numPages := reader.NumPage()
+	header := fmt.Sprintf("PDF · %d page%s", numPages, pluralS(numPages))
+	rawLines = append(rawLines, header, "")
+	highlightedLines = append(highlightedLines, ansiColor256(241, header), "")
+
+	for i := 1; i <= numPages; i++ {
+		page := reader.Page(i)
+		if page.V.IsNull() {
+			continue
+		}
+		text, err := page.GetPlainText(nil)
+		if err != nil || strings.TrimSpace(text) == "" {
+			continue
+		}
+		if numPages > 1 {
+			pageHeader := fmt.Sprintf("── page %d ──", i)
+			rawLines = append(rawLines, pageHeader)
+			highlightedLines = append(highlightedLines, ansiColor256(241, pageHeader))
+		}
+		for _, line := range strings.Split(strings.TrimRight(text, "\n\r "), "\n") {
+			rawLines = append(rawLines, line)
+			highlightedLines = append(highlightedLines, ansiColor256(252, line))
+		}
+		rawLines = append(rawLines, "")
+		highlightedLines = append(highlightedLines, "")
+	}
+
+	return rawLines, highlightedLines
+}
+
+func pluralS(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// copyToClipboard writes text to the system clipboard.
+func copyToClipboard(text string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+	case "linux":
+		cmd = exec.Command("xclip", "-selection", "clipboard")
+	default:
+		return fmt.Errorf("unsupported platform")
+	}
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run()
+}
+
+// clearFlashAfter returns a command that sends flashClearMsg after a delay.
+func clearFlashAfter(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(time.Time) tea.Msg { return flashClearMsg{} })
+}
+
+// getPreviewText returns the plain text content of the current preview.
+func (m *Model) getPreviewText() string {
+	if !m.preview.Valid {
+		return ""
+	}
+	if len(m.preview.RawLines) > 0 {
+		return strings.Join(m.preview.RawLines, "\n")
+	}
+	if m.preview.ImageRender != "" {
+		return stripANSI(m.preview.ImageRender)
+	}
+	return ""
+}
+
+// stripANSI removes all ANSI escape sequences from a string.
+func stripANSI(s string) string {
+	var out strings.Builder
+	i := 0
+	for i < len(s) {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
+				j++
+			}
+			if j < len(s) {
+				j++
+			}
+			i = j
+		} else {
+			out.WriteByte(s[i])
+			i++
+		}
+	}
+	return out.String()
+}
+
+func isZipBasedFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".zip", ".docx", ".xlsx", ".pptx",
+		".jar", ".war", ".ear",
+		".odt", ".ods", ".odp",
+		".epub":
+		return true
+	}
+	return false
+}
+
+// renderZipPreview extracts readable content from zip-based files.
+// For Office docs it extracts text; for plain zips it lists contents.
+func renderZipPreview(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+
+	switch ext {
+	case ".docx":
+		if text := extractZipXMLText(path, "word/document.xml"); text != "" {
+			return text
+		}
+	case ".pptx":
+		if text := extractPptxText(path); text != "" {
+			return text
+		}
+	case ".xlsx":
+		if text := extractXlsxText(path); text != "" {
+			return text
+		}
+	case ".epub":
+		// Could extract from OEBPS/content files, but list contents for now
+	case ".odt":
+		if text := extractZipXMLText(path, "content.xml"); text != "" {
+			return text
+		}
+	}
+
+	// Default: list zip contents
+	return listZipContents(path)
+}
+
+func extractZipXMLText(zipPath, xmlFile string) string {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return ""
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		if f.Name == xmlFile {
+			rc, err := f.Open()
+			if err != nil {
+				return ""
+			}
+			data, _ := io.ReadAll(rc)
+			rc.Close()
+			return extractTextFromXML(data)
+		}
+	}
+	return ""
+}
+
+// extractDocxStructured extracts text from a docx with heading detection and paragraph spacing.
+// Returns lines suitable for RawLines/HighlightedLines (wrappable, with gutters).
+func extractDocxStructured(zipPath string) (rawLines []string, highlightedLines []string) {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return nil, nil
+	}
+	defer r.Close()
+
+	var data []byte
+	for _, f := range r.File {
+		if f.Name == "word/document.xml" {
+			rc, err := f.Open()
+			if err != nil {
+				return nil, nil
+			}
+			data, _ = io.ReadAll(rc)
+			rc.Close()
+			break
+		}
+	}
+	if data == nil {
+		return nil, nil
+	}
+
+	type paragraph struct {
+		text  string
+		style string // e.g. "Heading1", "Heading2", "Title", "ListParagraph"
+	}
+
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	var paragraphs []paragraph
+	var currentText strings.Builder
+	var currentStyle string
+	inParagraph := false
+
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "p" {
+				inParagraph = true
+				currentText.Reset()
+				currentStyle = ""
+			}
+			// Paragraph style: <w:pStyle w:val="Heading1"/>
+			if t.Name.Local == "pStyle" && inParagraph {
+				for _, attr := range t.Attr {
+					if attr.Name.Local == "val" {
+						currentStyle = attr.Value
+					}
+				}
+			}
+			// List bullet: <w:numPr> indicates a list item
+			if t.Name.Local == "numPr" && inParagraph && currentStyle == "" {
+				currentStyle = "ListParagraph"
+			}
+		case xml.EndElement:
+			if t.Name.Local == "p" && inParagraph {
+				text := strings.TrimSpace(currentText.String())
+				paragraphs = append(paragraphs, paragraph{text: text, style: currentStyle})
+				inParagraph = false
+			}
+		case xml.CharData:
+			if inParagraph {
+				s := string(t)
+				if strings.TrimSpace(s) != "" {
+					currentText.WriteString(s)
+				}
+			}
+		}
+	}
+
+	// Convert paragraphs to styled lines
+	for i, p := range paragraphs {
+		if p.text == "" {
+			// Empty paragraph = blank line separator
+			rawLines = append(rawLines, "")
+			highlightedLines = append(highlightedLines, "")
+			continue
+		}
+
+		style := strings.ToLower(p.style)
+		switch {
+		case style == "title" || style == "heading1" || strings.HasPrefix(style, "heading1"):
+			// Add blank line before headings (unless first)
+			if i > 0 {
+				rawLines = append(rawLines, "")
+				highlightedLines = append(highlightedLines, "")
+			}
+			rawLines = append(rawLines, p.text)
+			highlightedLines = append(highlightedLines, ansiBoldColor256(109, strings.ToUpper(p.text)))
+		case style == "heading2" || strings.HasPrefix(style, "heading2"):
+			if i > 0 {
+				rawLines = append(rawLines, "")
+				highlightedLines = append(highlightedLines, "")
+			}
+			rawLines = append(rawLines, p.text)
+			highlightedLines = append(highlightedLines, ansiBoldColor256(109, p.text))
+		case style == "heading3" || strings.HasPrefix(style, "heading3"),
+			style == "heading4" || strings.HasPrefix(style, "heading4"):
+			if i > 0 {
+				rawLines = append(rawLines, "")
+				highlightedLines = append(highlightedLines, "")
+			}
+			rawLines = append(rawLines, p.text)
+			highlightedLines = append(highlightedLines, ansiBoldColor256(252, p.text))
+		case style == "listparagraph" || strings.Contains(style, "list"):
+			raw := "  • " + p.text
+			rawLines = append(rawLines, raw)
+			highlightedLines = append(highlightedLines, ansiColor256(241, "  • ")+ansiColor256(252, p.text))
+		default:
+			// Body text — add paragraph break after if next is also body
+			rawLines = append(rawLines, p.text)
+			highlightedLines = append(highlightedLines, ansiColor256(252, p.text))
+			// Add blank line between body paragraphs for readability
+			if i+1 < len(paragraphs) {
+				nextStyle := strings.ToLower(paragraphs[i+1].style)
+				nextIsBody := nextStyle == "" && paragraphs[i+1].text != ""
+				if nextIsBody {
+					rawLines = append(rawLines, "")
+					highlightedLines = append(highlightedLines, "")
+				}
+			}
+		}
+	}
+
+	return rawLines, highlightedLines
+}
+
+func extractPptxText(zipPath string) string {
+	rawLines, _ := extractPptxStructured(zipPath)
+	return strings.Join(rawLines, "\n")
+}
+
+// extractPptxStructured extracts slide content with title detection and dividers.
+func extractPptxStructured(zipPath string) (rawLines []string, highlightedLines []string) {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return nil, nil
+	}
+	defer r.Close()
+
+	// Collect slide files and sort them
+	var slideFiles []*zip.File
+	for _, f := range r.File {
+		if strings.HasPrefix(f.Name, "ppt/slides/slide") && strings.HasSuffix(f.Name, ".xml") {
+			slideFiles = append(slideFiles, f)
+		}
+	}
+	sort.Slice(slideFiles, func(i, j int) bool {
+		return slideFiles[i].Name < slideFiles[j].Name
+	})
+
+	header := fmt.Sprintf("%d slide%s", len(slideFiles), pluralS(len(slideFiles)))
+	rawLines = append(rawLines, header, "")
+	highlightedLines = append(highlightedLines, ansiColor256(241, header), "")
+
+	for _, f := range slideFiles {
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		data, _ := io.ReadAll(rc)
+		rc.Close()
+
+		slideNum := strings.TrimPrefix(f.Name, "ppt/slides/slide")
+		slideNum = strings.TrimSuffix(slideNum, ".xml")
+
+		shapes := extractPptxShapes(data)
+		if len(shapes) == 0 {
+			continue
+		}
+
+		// Slide divider
+		divider := fmt.Sprintf("━━ slide %s ━━", slideNum)
+		rawLines = append(rawLines, divider)
+		highlightedLines = append(highlightedLines, ansiBoldColor256(109, divider))
+
+		for _, shape := range shapes {
+			text := strings.TrimSpace(shape.text)
+			if text == "" {
+				continue
+			}
+			switch {
+			case shape.isTitle:
+				rawLines = append(rawLines, text)
+				highlightedLines = append(highlightedLines, ansiBoldColor256(252, text))
+			case shape.isSubtitle:
+				rawLines = append(rawLines, text)
+				highlightedLines = append(highlightedLines, ansiColor256(245, text))
+			default:
+				// Body text — split into lines for proper wrapping
+				for _, line := range strings.Split(text, "\n") {
+					line = strings.TrimSpace(line)
+					if line == "" {
+						continue
+					}
+					rawLines = append(rawLines, "  "+line)
+					highlightedLines = append(highlightedLines, "  "+ansiColor256(252, line))
+				}
+			}
+		}
+		rawLines = append(rawLines, "")
+		highlightedLines = append(highlightedLines, "")
+	}
+
+	return rawLines, highlightedLines
+}
+
+type pptxShape struct {
+	text       string
+	isTitle    bool
+	isSubtitle bool
+}
+
+// extractPptxShapes parses a slide XML and returns text shapes with type info.
+func extractPptxShapes(data []byte) []pptxShape {
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	var shapes []pptxShape
+	var currentText strings.Builder
+	isTitle := false
+	isSubtitle := false
+	inShape := false
+	depth := 0
+
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "sp" {
+				inShape = true
+				depth = 0
+				isTitle = false
+				isSubtitle = false
+				currentText.Reset()
+			}
+			if inShape {
+				depth++
+			}
+			// Detect placeholder type
+			if t.Name.Local == "ph" && inShape {
+				for _, attr := range t.Attr {
+					if attr.Name.Local == "type" {
+						switch attr.Value {
+						case "title", "ctrTitle":
+							isTitle = true
+						case "subTitle":
+							isSubtitle = true
+						}
+					}
+				}
+			}
+			// New paragraph within shape = newline
+			if t.Name.Local == "p" && inShape && currentText.Len() > 0 {
+				currentText.WriteString("\n")
+			}
+		case xml.EndElement:
+			if t.Name.Local == "sp" && inShape {
+				text := currentText.String()
+				if strings.TrimSpace(text) != "" {
+					shapes = append(shapes, pptxShape{
+						text:       text,
+						isTitle:    isTitle,
+						isSubtitle: isSubtitle,
+					})
+				}
+				inShape = false
+			}
+			if inShape {
+				depth--
+			}
+		case xml.CharData:
+			if inShape {
+				s := strings.TrimSpace(string(t))
+				if s != "" {
+					currentText.WriteString(s)
+					currentText.WriteString(" ")
+				}
+			}
+		}
+	}
+	return shapes
+}
+
+// extractOdtStructured extracts text from an ODT with heading detection.
+// ODT uses <text:h> for headings (with outline-level) and <text:p> for paragraphs.
+func extractOdtStructured(zipPath string) (rawLines []string, highlightedLines []string) {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return nil, nil
+	}
+	defer r.Close()
+
+	var data []byte
+	for _, f := range r.File {
+		if f.Name == "content.xml" {
+			rc, err := f.Open()
+			if err != nil {
+				return nil, nil
+			}
+			data, _ = io.ReadAll(rc)
+			rc.Close()
+			break
+		}
+	}
+	if data == nil {
+		return nil, nil
+	}
+
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	var currentText strings.Builder
+	inHeading := false
+	headingLevel := 0
+	inParagraph := false
+
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "h" {
+				inHeading = true
+				headingLevel = 1
+				currentText.Reset()
+				for _, attr := range t.Attr {
+					if attr.Name.Local == "outline-level" {
+						fmt.Sscanf(attr.Value, "%d", &headingLevel)
+					}
+				}
+			}
+			if t.Name.Local == "p" && !inHeading {
+				inParagraph = true
+				currentText.Reset()
+			}
+		case xml.EndElement:
+			if t.Name.Local == "h" && inHeading {
+				text := strings.TrimSpace(currentText.String())
+				if text != "" {
+					rawLines = append(rawLines, "", text)
+					switch {
+					case headingLevel <= 1:
+						highlightedLines = append(highlightedLines, "", ansiBoldColor256(109, strings.ToUpper(text)))
+					case headingLevel == 2:
+						highlightedLines = append(highlightedLines, "", ansiBoldColor256(109, text))
+					default:
+						highlightedLines = append(highlightedLines, "", ansiBoldColor256(252, text))
+					}
+				}
+				inHeading = false
+			}
+			if t.Name.Local == "p" && inParagraph {
+				text := strings.TrimSpace(currentText.String())
+				if text != "" {
+					rawLines = append(rawLines, text)
+					highlightedLines = append(highlightedLines, ansiColor256(252, text))
+				}
+				inParagraph = false
+			}
+		case xml.CharData:
+			if inHeading || inParagraph {
+				s := string(t)
+				if strings.TrimSpace(s) != "" {
+					currentText.WriteString(s)
+				}
+			}
+		}
+	}
+
+	return rawLines, highlightedLines
+}
+
+func extractXlsxText(zipPath string) string {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return ""
+	}
+	defer r.Close()
+
+	// First extract shared strings
+	var sharedStrings []string
+	for _, f := range r.File {
+		if f.Name == "xl/sharedStrings.xml" {
+			rc, err := f.Open()
+			if err != nil {
+				break
+			}
+			data, _ := io.ReadAll(rc)
+			rc.Close()
+			sharedStrings = parseXlsxSharedStrings(data)
+			break
+		}
+	}
+
+	// Then extract sheet data
+	var result strings.Builder
+	var sheetFiles []*zip.File
+	for _, f := range r.File {
+		if strings.HasPrefix(f.Name, "xl/worksheets/sheet") && strings.HasSuffix(f.Name, ".xml") {
+			sheetFiles = append(sheetFiles, f)
+		}
+	}
+	sort.Slice(sheetFiles, func(i, j int) bool {
+		return sheetFiles[i].Name < sheetFiles[j].Name
+	})
+
+	for _, f := range sheetFiles {
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		data, _ := io.ReadAll(rc)
+		rc.Close()
+		rows := extractXlsxSheetRows(data, sharedStrings)
+		if len(rows) > 0 {
+			sheetNum := strings.TrimPrefix(f.Name, "xl/worksheets/sheet")
+			sheetNum = strings.TrimSuffix(sheetNum, ".xml")
+			result.WriteString(ansiColor256(241, fmt.Sprintf("── sheet %s ──", sheetNum)) + "\n")
+			result.WriteString(renderTable(rows))
+			result.WriteString("\n\n")
+		}
+	}
+	return strings.TrimSpace(result.String())
+}
+
+func parseXlsxSharedStrings(data []byte) []string {
+	var strings_ []string
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	var current strings.Builder
+	inSI := false
+
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "si" {
+				inSI = true
+				current.Reset()
+			}
+		case xml.EndElement:
+			if t.Name.Local == "si" {
+				strings_ = append(strings_, current.String())
+				inSI = false
+			}
+		case xml.CharData:
+			if inSI {
+				current.Write(t)
+			}
+		}
+	}
+	return strings_
+}
+
+func extractXlsxSheetRows(data []byte, sharedStrings []string) [][]string {
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	var rows [][]string
+	var currentRow []string
+	var cellValue strings.Builder
+	var cellType string
+	inRow := false
+	inValue := false
+
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "row" {
+				inRow = true
+				currentRow = nil
+			} else if t.Name.Local == "c" {
+				cellType = ""
+				for _, attr := range t.Attr {
+					if attr.Name.Local == "t" {
+						cellType = attr.Value
+					}
+				}
+				cellValue.Reset()
+			} else if t.Name.Local == "v" || t.Name.Local == "t" {
+				inValue = true
+			}
+		case xml.EndElement:
+			if t.Name.Local == "v" || t.Name.Local == "t" {
+				inValue = false
+			} else if t.Name.Local == "row" {
+				if inRow && len(currentRow) > 0 {
+					rows = append(rows, currentRow)
+				}
+				inRow = false
+			} else if t.Name.Local == "c" {
+				val := cellValue.String()
+				if cellType == "s" {
+					idx := 0
+					fmt.Sscanf(val, "%d", &idx)
+					if idx < len(sharedStrings) {
+						val = sharedStrings[idx]
+					}
+				}
+				currentRow = append(currentRow, val)
+			}
+		case xml.CharData:
+			if inValue {
+				cellValue.Write(t)
+			}
+		}
+	}
+	return rows
+}
+
+// ansiTrimLeft skips n visible columns from the left while preserving ANSI escapes.
+func ansiTrimLeft(s string, n int) string {
+	var out strings.Builder
+	col := 0
+	i := 0
+	// First pass: skip n visible columns, but emit any ANSI sequences encountered
+	for i < len(s) && col < n {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			// ANSI escape — collect and emit (these set color state)
+			j := i + 2
+			for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
+				j++
+			}
+			if j < len(s) {
+				j++ // include the final letter
+			}
+			out.WriteString(s[i:j])
+			i = j
+		} else {
+			// Visible character — skip it (advance by full rune, not single byte)
+			_, size := utf8.DecodeRuneInString(s[i:])
+			col++
+			i += size
+		}
+	}
+	// Emit the rest
+	out.WriteString(s[i:])
+	return out.String()
+}
+
+// ANSI color helpers for goroutine-safe rendering (lipgloss needs TTY context)
+func ansiColor256(code int, text string) string {
+	return fmt.Sprintf("\x1b[38;5;%dm%s\x1b[0m", code, text)
+}
+
+func ansiBoldColor256(code int, text string) string {
+	return fmt.Sprintf("\x1b[1;38;5;%dm%s\x1b[0m", code, text)
+}
+
+// Rainbow column palette — distinct, readable colors on dark backgrounds
+var rainbowCols = []int{
+	109, // cyan
+	179, // yellow
+	174, // salmon
+	114, // green
+	141, // purple
+	215, // orange
+	74,  // blue
+	218, // pink
+	150, // lime
+	183, // lavender
+}
+
+// renderTable renders rows as a rainbow-colored aligned table (each column = one color).
+// Uses raw ANSI escapes because this runs in async goroutines without TTY context.
+func renderTable(rows [][]string) string {
+	if len(rows) == 0 {
+		return ""
+	}
+
+	// Find max columns
+	maxCols := 0
+	for _, row := range rows {
+		if len(row) > maxCols {
+			maxCols = len(row)
+		}
+	}
+
+	// Calculate column widths
+	colWidths := make([]int, maxCols)
+	for _, row := range rows {
+		for i, cell := range row {
+			w := len(strings.TrimSpace(cell))
+			if w > colWidths[i] {
+				colWidths[i] = w
+			}
+		}
+	}
+
+	// Cap column widths
+	for i := range colWidths {
+		if colWidths[i] > 30 {
+			colWidths[i] = 30
+		}
+		if colWidths[i] < 2 {
+			colWidths[i] = 2
+		}
+	}
+
+	sep := ansiColor256(241, " │ ")
+
+	var b strings.Builder
+	for rowIdx, row := range rows {
+		for colIdx := 0; colIdx < maxCols; colIdx++ {
+			if colIdx > 0 {
+				b.WriteString(sep)
+			}
+
+			cell := ""
+			if colIdx < len(row) {
+				cell = strings.TrimSpace(row[colIdx])
+			}
+
+			// Truncate if needed
+			if len(cell) > colWidths[colIdx] {
+				cell = cell[:colWidths[colIdx]-1] + "…"
+			}
+
+			// Pad to column width
+			pad := colWidths[colIdx] - len(cell)
+			if pad < 0 {
+				pad = 0
+			}
+			padded := cell + strings.Repeat(" ", pad)
+
+			color := rainbowCols[colIdx%len(rainbowCols)]
+			if rowIdx == 0 {
+				b.WriteString(ansiBoldColor256(color, padded))
+			} else {
+				b.WriteString(ansiColor256(color, padded))
+			}
+		}
+		b.WriteString("\n")
+
+		// Separator after header
+		if rowIdx == 0 {
+			for colIdx := 0; colIdx < maxCols; colIdx++ {
+				if colIdx > 0 {
+					b.WriteString(ansiColor256(241, "─┼─"))
+				}
+				b.WriteString(ansiColor256(241, strings.Repeat("─", colWidths[colIdx])))
+			}
+			b.WriteString("\n")
+		}
+	}
+
+	return b.String()
+}
+
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, c := range s {
+		if c >= '0' && c <= '9' {
+			continue
+		}
+		if c == '.' || c == '-' || c == '+' || c == ',' || c == '%' || c == '$' {
+			continue
+		}
+		if (c == 'e' || c == 'E') && i > 0 {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// extractTextFromXML extracts text content from Office XML, with newlines at paragraph boundaries.
+func extractTextFromXML(data []byte) string {
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	var result strings.Builder
+
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.EndElement:
+			// Insert newline at paragraph boundaries
+			if t.Name.Local == "p" || t.Name.Local == "si" {
+				result.WriteString("\n")
+			}
+		case xml.CharData:
+			text := strings.TrimSpace(string(t))
+			if text != "" {
+				result.WriteString(text)
+				result.WriteString(" ")
+			}
+		}
+	}
+
+	// Clean up multiple blank lines
+	text := result.String()
+	lines := strings.Split(text, "\n")
+	var cleaned []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			cleaned = append(cleaned, line)
+		}
+	}
+	return strings.Join(cleaned, "\n")
+}
+
+func listZipContents(path string) string {
+	r, err := zip.OpenReader(path)
+	if err != nil {
+		return "couldn't read archive"
+	}
+	defer r.Close()
+
+	info, _ := os.Stat(path)
+	var header string
+	fileCount := 0
+	for _, f := range r.File {
+		if !f.FileInfo().IsDir() {
+			fileCount++
+		}
+	}
+	if info != nil {
+		header = fmt.Sprintf("%s  %s  %d files\n", filepath.Base(path), formatFileSize(info.Size()), fileCount)
+	}
+
+	var lines []string
+	for _, f := range r.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		size := formatFileSize(int64(f.UncompressedSize64))
+		lines = append(lines, fmt.Sprintf("  %8s  %s", size, f.Name))
+	}
+
+	return header + strings.Join(lines, "\n")
 }
 
 // View implements tea.Model
@@ -969,12 +2350,17 @@ func (m Model) renderPreviewHeader() string {
 	f := m.files[m.selected]
 	basename := filepath.Base(f.Path)
 	header := "  " + cyanStyle.Render(basename) + "  " + dimStyle.Render(f.ChangeType())
-	hint := keyStyle.Render("j k") + dimStyle.Render(" scroll  ")
+	hint := keyStyle.Render("h l") + dimStyle.Render(" pan  ") + keyStyle.Render("j k") + dimStyle.Render(" scroll  ")
 	return padLine(header, hint, m.width) + "\n"
 }
 
 func (m Model) renderFooter() string {
-	leftHint := dimStyle.Render("hold ") + keyStyle.Render("shift") + dimStyle.Render(" to select text")
+	if m.flashMsg != "" && time.Now().Before(m.flashExpiry) {
+		leftHint := cyanStyle.Render("  ✓ " + m.flashMsg)
+		rightHint := keyStyle.Render("q") + dimStyle.Render(" quit  ")
+		return padLine(leftHint, rightHint, m.width)
+	}
+	leftHint := keyStyle.Render("  c") + dimStyle.Render(" copy  ") + keyStyle.Render("p") + dimStyle.Render(" path  ")
 	rightHint := keyStyle.Render("q") + dimStyle.Render(" quit  ")
 	return padLine(leftHint, rightHint, m.width)
 }
