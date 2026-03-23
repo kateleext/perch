@@ -282,6 +282,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmds = append(cmds, clearFlashAfter(2*time.Second))
 				}
 			}
+		case "o":
+			if m.selected >= 0 && m.selected < len(m.files) {
+				file := m.files[m.selected]
+				fullPath := filepath.Join(m.dir, file.Path)
+				var cmd *exec.Cmd
+				if runtime.GOOS == "darwin" {
+					cmd = exec.Command("open", fullPath)
+				} else {
+					cmd = exec.Command("xdg-open", fullPath)
+				}
+				if cmd.Start() == nil {
+					m.flashMsg = "opened"
+					m.flashExpiry = time.Now().Add(2 * time.Second)
+					cmds = append(cmds, clearFlashAfter(2*time.Second))
+				}
+			}
 		case "g":
 			m.viewport.GotoTop()
 		case "G":
@@ -487,16 +503,26 @@ func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
 		// Check if it's a zip-based file (docx, xlsx, pptx, zip, etc.)
 		if isZipBasedFile(file.Path) {
 			ext := strings.ToLower(filepath.Ext(file.Path))
-			// Docx/pptx: structured extraction with headings, wrapping, gutters
-			if ext == ".docx" || ext == ".pptx" || ext == ".odt" {
+			// Structured extraction for supported Office formats
+			if ext == ".docx" || ext == ".pptx" || ext == ".odt" || ext == ".xlsx" {
 				var rawLines, hlLines []string
+				var extractErr error
 				switch ext {
 				case ".docx":
-					rawLines, hlLines = extractDocxStructured(fullPath)
+					rawLines, hlLines, extractErr = safeExtractStructured(func() ([]string, []string) { return extractDocxStructured(fullPath) })
 				case ".pptx":
-					rawLines, hlLines = extractPptxStructured(fullPath)
+					rawLines, hlLines, extractErr = safeExtractStructured(func() ([]string, []string) { return extractPptxStructured(fullPath) })
 				case ".odt":
-					rawLines, hlLines = extractOdtStructured(fullPath)
+					rawLines, hlLines, extractErr = safeExtractStructured(func() ([]string, []string) { return extractOdtStructured(fullPath) })
+				case ".xlsx":
+					rawLines, hlLines, extractErr = safeExtractStructured(func() ([]string, []string) { return extractXlsxStructured(fullPath) })
+				}
+				if extractErr != nil {
+					return previewLoadedMsg{
+						selectedIndex: selectedIndex,
+						gen:           gen,
+						preview:       PreviewContent{Valid: true, Message: fmt.Sprintf("%s\n%s — could not parse", filepath.Base(file.Path), ext)},
+					}
 				}
 				if len(rawLines) > 0 {
 					return previewLoadedMsg{
@@ -511,8 +537,15 @@ func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
 					}
 				}
 			}
-			// xlsx/zip/etc: ImageRender (tables, raw ANSI)
-			text := renderZipPreview(fullPath)
+			// Remaining zip-based formats: list contents
+			text, extractErr := safeExtractText(func() string { return renderZipPreview(fullPath) })
+			if extractErr != nil || text == "" {
+				return previewLoadedMsg{
+					selectedIndex: selectedIndex,
+					gen:           gen,
+					preview:       PreviewContent{Valid: true, Message: fmt.Sprintf("%s\n%s — format not supported", filepath.Base(file.Path), ext)},
+				}
+			}
 			return previewLoadedMsg{
 				selectedIndex: selectedIndex,
 				gen:           gen,
@@ -522,7 +555,14 @@ func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
 
 		// Check if it's a PDF
 		if strings.ToLower(filepath.Ext(file.Path)) == ".pdf" {
-			rawLines, hlLines := extractPdfStructured(fullPath)
+			rawLines, hlLines, extractErr := safeExtractStructured(func() ([]string, []string) { return extractPdfStructured(fullPath) })
+			if extractErr != nil {
+				return previewLoadedMsg{
+					selectedIndex: selectedIndex,
+					gen:           gen,
+					preview:       PreviewContent{Valid: true, Message: filepath.Base(file.Path) + "\n.pdf — could not parse"},
+				}
+			}
 			if len(rawLines) > 0 {
 				return previewLoadedMsg{
 					selectedIndex: selectedIndex,
@@ -545,9 +585,9 @@ func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
 		// Check if file type is supported text
 		if !isSupportedTextFile(file.Path) {
 			info, _ := os.Stat(fullPath)
-			reason := "binary file — open in your editor"
+			reason := "binary file — press o to open"
 			if filepath.Ext(file.Path) == "" {
-				reason = "no file extension — open in your editor"
+				reason = "no file extension — press o to open"
 			}
 			sizeHint := ""
 			if info != nil {
@@ -581,7 +621,39 @@ func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
 			}
 		}
 
+		// Guard against binary content that slipped past extension whitelist
+		if isBinaryContent(content) {
+			info, _ := os.Stat(fullPath)
+			sizeHint := ""
+			if info != nil {
+				sizeHint = formatFileSize(info.Size()) + " · "
+			}
+			return previewLoadedMsg{
+				selectedIndex: selectedIndex,
+				gen:           gen,
+				preview:       PreviewContent{Valid: true, Message: fmt.Sprintf("%s\n%sbinary file — press o to open", filepath.Base(file.Path), sizeHint)},
+			}
+		}
+
 		rawLines := strings.Split(string(content), "\n")
+
+		// CSV/TSV: render as aligned table with horizontal scroll (no wrapping)
+		if sep := isTabularFile(file.Path); sep != 0 {
+			hlLines := highlightCSVLines(rawLines, sep)
+			tableRender := strings.Join(hlLines, "\n")
+			return previewLoadedMsg{
+				selectedIndex: selectedIndex,
+				gen:           gen,
+				preview: PreviewContent{
+					Valid:       true,
+					RawLines:    rawLines,
+					ImageRender: tableRender,
+					DiffLines:   diffLines,
+					DiffStats:   diffStats,
+				},
+			}
+		}
+
 		var highlightedLines []string
 		if isMarkdownERBFile(file.Path) {
 			highlightedLines = highlightMarkdownLines(rawLines, file.Path)
@@ -668,35 +740,43 @@ func (m *Model) updatePreviewKeepScroll(keepScroll bool) {
 	// Check if it's a zip-based file (docx, xlsx, pptx, zip, etc.)
 	if isZipBasedFile(file.Path) {
 		ext := strings.ToLower(filepath.Ext(file.Path))
-		if ext == ".docx" || ext == ".pptx" || ext == ".odt" {
+		if ext == ".docx" || ext == ".pptx" || ext == ".odt" || ext == ".xlsx" {
 			var rawLines, hlLines []string
+			var extractErr error
 			switch ext {
 			case ".docx":
-				rawLines, hlLines = extractDocxStructured(fullPath)
+				rawLines, hlLines, extractErr = safeExtractStructured(func() ([]string, []string) { return extractDocxStructured(fullPath) })
 			case ".pptx":
-				rawLines, hlLines = extractPptxStructured(fullPath)
+				rawLines, hlLines, extractErr = safeExtractStructured(func() ([]string, []string) { return extractPptxStructured(fullPath) })
 			case ".odt":
-				rawLines, hlLines = extractOdtStructured(fullPath)
+				rawLines, hlLines, extractErr = safeExtractStructured(func() ([]string, []string) { return extractOdtStructured(fullPath) })
+			case ".xlsx":
+				rawLines, hlLines, extractErr = safeExtractStructured(func() ([]string, []string) { return extractXlsxStructured(fullPath) })
 			}
-			if len(rawLines) > 0 {
+			if extractErr != nil {
+				m.preview = PreviewContent{Valid: true, Message: fmt.Sprintf("%s\n%s — could not parse", filepath.Base(file.Path), ext)}
+			} else if len(rawLines) > 0 {
 				m.preview = PreviewContent{
 					Valid:            true,
 					RawLines:         rawLines,
 					HighlightedLines: hlLines,
 					DiffLines:        make(map[int]string),
 				}
-				m.viewport.SetContent(m.renderPreviewContent())
-				if !keepScroll {
-					m.viewport.GotoTop()
-				}
-				m.lastSelectedFile = m.selected
-				return
+			} else {
+				m.preview = PreviewContent{Valid: true, Message: fmt.Sprintf("%s\n%s — no extractable content", filepath.Base(file.Path), ext)}
 			}
+			m.viewport.SetContent(m.renderPreviewContent())
+			if !keepScroll {
+				m.viewport.GotoTop()
+			}
+			m.lastSelectedFile = m.selected
+			return
 		}
-		text := renderZipPreview(fullPath)
-		m.preview = PreviewContent{
-			Valid:       true,
-			ImageRender: text,
+		text, extractErr := safeExtractText(func() string { return renderZipPreview(fullPath) })
+		if extractErr != nil || text == "" {
+			m.preview = PreviewContent{Valid: true, Message: fmt.Sprintf("%s\n%s — format not supported", filepath.Base(file.Path), ext)}
+		} else {
+			m.preview = PreviewContent{Valid: true, ImageRender: text}
 		}
 		m.viewport.SetContent(m.renderPreviewContent())
 		if !keepScroll {
@@ -708,8 +788,10 @@ func (m *Model) updatePreviewKeepScroll(keepScroll bool) {
 
 	// Check if it's a PDF
 	if strings.ToLower(filepath.Ext(file.Path)) == ".pdf" {
-		rawLines, hlLines := extractPdfStructured(fullPath)
-		if len(rawLines) > 0 {
+		rawLines, hlLines, extractErr := safeExtractStructured(func() ([]string, []string) { return extractPdfStructured(fullPath) })
+		if extractErr != nil {
+			m.preview = PreviewContent{Valid: true, Message: filepath.Base(file.Path) + "\n.pdf — could not parse"}
+		} else if len(rawLines) > 0 {
 			m.preview = PreviewContent{
 				Valid:            true,
 				RawLines:         rawLines,
@@ -730,9 +812,9 @@ func (m *Model) updatePreviewKeepScroll(keepScroll bool) {
 	// Check if file type is supported text
 	if !isSupportedTextFile(file.Path) {
 		info, _ := os.Stat(fullPath)
-		reason := "binary file — open in your editor"
+		reason := "binary file — press o to open"
 		if filepath.Ext(file.Path) == "" {
-			reason = "no file extension — open in your editor"
+			reason = "no file extension — press o to open"
 		}
 		sizeHint := ""
 		if info != nil {
@@ -774,7 +856,43 @@ func (m *Model) updatePreviewKeepScroll(keepScroll bool) {
 		return
 	}
 
+	// Guard against binary content that slipped past extension whitelist
+	if isBinaryContent(content) {
+		info, _ := os.Stat(fullPath)
+		sizeHint := ""
+		if info != nil {
+			sizeHint = formatFileSize(info.Size()) + " · "
+		}
+		m.preview = PreviewContent{Valid: true, Message: fmt.Sprintf("%s\n%sbinary file — press o to open", filepath.Base(file.Path), sizeHint)}
+		m.viewport.SetContent(m.renderPreviewContent())
+		if !keepScroll {
+			m.viewport.GotoTop()
+		}
+		m.lastSelectedFile = m.selected
+		return
+	}
+
 	rawLines := strings.Split(string(content), "\n")
+
+	// CSV/TSV: render as aligned table with horizontal scroll (no wrapping)
+	if sep := isTabularFile(file.Path); sep != 0 {
+		hlLines := highlightCSVLines(rawLines, sep)
+		tableRender := strings.Join(hlLines, "\n")
+		m.preview = PreviewContent{
+			Valid:       true,
+			RawLines:    rawLines,
+			ImageRender: tableRender,
+			DiffLines:   diffLines,
+			DiffStats:   diffStats,
+		}
+		m.viewport.SetContent(m.renderPreviewContent())
+		if !keepScroll {
+			m.viewport.GotoTop()
+		}
+		m.lastSelectedFile = m.selected
+		return
+	}
+
 	var highlightedLines []string
 	if isMarkdownERBFile(file.Path) {
 		highlightedLines = highlightMarkdownLines(rawLines, file.Path)
@@ -809,17 +927,18 @@ func (m *Model) renderPreviewContent() string {
 		return ""
 	}
 
-	// ImageRender is raw terminal output — apply horizontal scroll if needed
+	// ImageRender is raw terminal output — apply horizontal scroll and truncate to viewport
 	if m.preview.ImageRender != "" {
-		if m.xOffset == 0 {
-			return m.preview.ImageRender
-		}
 		lines := strings.Split(m.preview.ImageRender, "\n")
-		shifted := make([]string, len(lines))
+		viewW := m.width
+		result := make([]string, len(lines))
 		for i, line := range lines {
-			shifted[i] = ansiTrimLeft(line, m.xOffset)
+			if m.xOffset > 0 {
+				line = ansiTrimLeft(line, m.xOffset)
+			}
+			result[i] = ansiTruncate(line, viewW)
 		}
-		return strings.Join(shifted, "\n")
+		return strings.Join(result, "\n")
 	}
 
 	if m.preview.Message != "" {
@@ -1097,6 +1216,30 @@ var supportedFilenames = map[string]bool{
 	".tool-versions": true,
 }
 
+// isBinaryContent checks the first chunk of file content for binary data.
+// Returns true if the content contains null bytes or a high ratio of non-printable chars.
+func isBinaryContent(data []byte) bool {
+	// Check first 8KB
+	check := data
+	if len(check) > 8192 {
+		check = check[:8192]
+	}
+	if len(check) == 0 {
+		return false
+	}
+	nonPrintable := 0
+	for _, b := range check {
+		if b == 0 {
+			return true // null byte = definitely binary
+		}
+		if b < 32 && b != '\n' && b != '\r' && b != '\t' {
+			nonPrintable++
+		}
+	}
+	// More than 10% non-printable = likely binary
+	return float64(nonPrintable)/float64(len(check)) > 0.1
+}
+
 func isSupportedTextFile(path string) bool {
 	base := strings.ToLower(filepath.Base(path))
 	if supportedFilenames[base] {
@@ -1369,6 +1512,28 @@ func stripANSI(s string) string {
 		}
 	}
 	return out.String()
+}
+
+// safeExtractStructured wraps a structured extraction function with panic recovery.
+func safeExtractStructured(fn func() ([]string, []string)) (rawLines []string, hlLines []string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+	rawLines, hlLines = fn()
+	return
+}
+
+// safeExtractText wraps a text extraction function with panic recovery.
+func safeExtractText(fn func() string) (text string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+	text = fn()
+	return
 }
 
 func isZipBasedFile(path string) bool {
@@ -1814,6 +1979,91 @@ func extractOdtStructured(zipPath string) (rawLines []string, highlightedLines [
 	return rawLines, highlightedLines
 }
 
+// extractXlsxStructured extracts xlsx data as CSV-like lines with colored columns.
+// Returns lines suitable for RawLines/HighlightedLines (wrappable, with gutters).
+func extractXlsxStructured(zipPath string) (rawLines []string, highlightedLines []string) {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return nil, nil
+	}
+	defer r.Close()
+
+	// Extract shared strings
+	var sharedStrings []string
+	for _, f := range r.File {
+		if f.Name == "xl/sharedStrings.xml" {
+			rc, err := f.Open()
+			if err != nil {
+				break
+			}
+			data, _ := io.ReadAll(rc)
+			rc.Close()
+			sharedStrings = parseXlsxSharedStrings(data)
+			break
+		}
+	}
+
+	// Find sheet files
+	var sheetFiles []*zip.File
+	for _, f := range r.File {
+		if strings.HasPrefix(f.Name, "xl/worksheets/sheet") && strings.HasSuffix(f.Name, ".xml") {
+			sheetFiles = append(sheetFiles, f)
+		}
+	}
+	sort.Slice(sheetFiles, func(i, j int) bool {
+		return sheetFiles[i].Name < sheetFiles[j].Name
+	})
+
+	for _, f := range sheetFiles {
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		data, _ := io.ReadAll(rc)
+		rc.Close()
+		rows := extractXlsxSheetRows(data, sharedStrings)
+		if len(rows) == 0 {
+			continue
+		}
+
+		// Sheet header
+		sheetNum := strings.TrimPrefix(f.Name, "xl/worksheets/sheet")
+		sheetNum = strings.TrimSuffix(sheetNum, ".xml")
+		if len(sheetFiles) > 1 {
+			rawLines = append(rawLines, fmt.Sprintf("── sheet %s ──", sheetNum))
+			highlightedLines = append(highlightedLines, ansiColor256(241, fmt.Sprintf("── sheet %s ──", sheetNum)))
+		}
+
+		// Emit rows as comma-separated values
+		for rowIdx, row := range rows {
+			// Raw: plain CSV
+			rawLine := strings.Join(row, ", ")
+			rawLines = append(rawLines, rawLine)
+
+			// Highlighted: colored columns
+			var hlParts []string
+			for colIdx, cell := range row {
+				cell = strings.TrimSpace(cell)
+				color := rainbowCols[colIdx%len(rainbowCols)]
+				if rowIdx == 0 {
+					hlParts = append(hlParts, ansiBoldColor256(color, cell))
+				} else {
+					hlParts = append(hlParts, ansiColor256(color, cell))
+				}
+			}
+			highlightedLines = append(highlightedLines, strings.Join(hlParts, ansiColor256(241, ", ")))
+		}
+
+		// Blank line between sheets
+		if len(sheetFiles) > 1 {
+			rawLines = append(rawLines, "")
+			highlightedLines = append(highlightedLines, "")
+		}
+	}
+
+	return rawLines, highlightedLines
+}
+
 func extractXlsxText(zipPath string) string {
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
@@ -1986,6 +2236,38 @@ func ansiTrimLeft(s string, n int) string {
 	return out.String()
 }
 
+// ansiTruncate keeps only the first n visible columns, preserving ANSI escapes.
+// Appends a reset sequence if the line was truncated mid-style.
+func ansiTruncate(s string, n int) string {
+	var out strings.Builder
+	col := 0
+	i := 0
+	for i < len(s) {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			// ANSI escape — always emit
+			j := i + 2
+			for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
+				j++
+			}
+			if j < len(s) {
+				j++ // include the final letter
+			}
+			out.WriteString(s[i:j])
+			i = j
+		} else {
+			if col >= n {
+				out.WriteString("\x1b[0m")
+				return out.String()
+			}
+			_, size := utf8.DecodeRuneInString(s[i:])
+			out.WriteString(s[i : i+size])
+			col++
+			i += size
+		}
+	}
+	return out.String()
+}
+
 // ANSI color helpers for goroutine-safe rendering (lipgloss needs TTY context)
 func ansiColor256(code int, text string) string {
 	return fmt.Sprintf("\x1b[38;5;%dm%s\x1b[0m", code, text)
@@ -2007,6 +2289,128 @@ var rainbowCols = []int{
 	218, // pink
 	150, // lime
 	183, // lavender
+}
+
+// highlightCSVLines takes raw CSV/TSV lines and returns rainbow-colored highlighted lines.
+// Each column gets a distinct color from rainbowCols. First row is bold (header).
+func highlightCSVLines(rawLines []string, sep rune) []string {
+	if len(rawLines) == 0 {
+		return nil
+	}
+
+	// Parse all rows to find max columns and column widths
+	parsed := make([][]string, 0, len(rawLines))
+	maxCols := 0
+	for _, line := range rawLines {
+		if strings.TrimSpace(line) == "" {
+			parsed = append(parsed, nil)
+			continue
+		}
+		fields := splitCSVLine(line, sep)
+		parsed = append(parsed, fields)
+		if len(fields) > maxCols {
+			maxCols = len(fields)
+		}
+	}
+
+	if maxCols == 0 {
+		return nil
+	}
+
+	// Calculate column widths (capped at 30)
+	colWidths := make([]int, maxCols)
+	for _, fields := range parsed {
+		for i, f := range fields {
+			w := len(strings.TrimSpace(f))
+			if w > colWidths[i] {
+				colWidths[i] = w
+			}
+		}
+	}
+	for i := range colWidths {
+		if colWidths[i] > 30 {
+			colWidths[i] = 30
+		}
+		if colWidths[i] < 2 {
+			colWidths[i] = 2
+		}
+	}
+
+	sepStr := ansiColor256(241, " │ ")
+	hlLines := make([]string, 0, len(parsed))
+
+	for rowIdx, fields := range parsed {
+		if fields == nil {
+			hlLines = append(hlLines, "")
+			continue
+		}
+
+		var b strings.Builder
+		for colIdx := 0; colIdx < maxCols; colIdx++ {
+			if colIdx > 0 {
+				b.WriteString(sepStr)
+			}
+
+			cell := ""
+			if colIdx < len(fields) {
+				cell = strings.TrimSpace(fields[colIdx])
+			}
+
+			// Truncate
+			if len(cell) > colWidths[colIdx] {
+				cell = cell[:colWidths[colIdx]-1] + "…"
+			}
+
+			// Pad
+			pad := colWidths[colIdx] - len(cell)
+			if pad < 0 {
+				pad = 0
+			}
+			padded := cell + strings.Repeat(" ", pad)
+
+			color := rainbowCols[colIdx%len(rainbowCols)]
+			if rowIdx == 0 {
+				b.WriteString(ansiBoldColor256(color, padded))
+			} else {
+				b.WriteString(ansiColor256(color, padded))
+			}
+		}
+		hlLines = append(hlLines, b.String())
+	}
+
+	return hlLines
+}
+
+// splitCSVLine splits a line by the separator, respecting quoted fields.
+func splitCSVLine(line string, sep rune) []string {
+	var fields []string
+	var current strings.Builder
+	inQuotes := false
+
+	for _, r := range line {
+		if r == '"' {
+			inQuotes = !inQuotes
+		} else if r == sep && !inQuotes {
+			fields = append(fields, current.String())
+			current.Reset()
+		} else {
+			current.WriteRune(r)
+		}
+	}
+	fields = append(fields, current.String())
+	return fields
+}
+
+// isTabularFile returns the separator for CSV/TSV files, or 0 if not tabular.
+func isTabularFile(path string) rune {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".csv":
+		return ','
+	case ".tsv":
+		return '\t'
+	}
+	return 0
 }
 
 // renderTable renders rows as a rainbow-colored aligned table (each column = one color).
@@ -2349,8 +2753,19 @@ func (m Model) renderPreviewHeader() string {
 
 	f := m.files[m.selected]
 	basename := filepath.Base(f.Path)
-	header := "  " + cyanStyle.Render(basename) + "  " + dimStyle.Render(f.ChangeType())
+	changeInfo := "  " + dimStyle.Render(f.ChangeType())
 	hint := keyStyle.Render("h l") + dimStyle.Render(" pan  ") + keyStyle.Render("j k") + dimStyle.Render(" scroll  ")
+	hintWidth := lipgloss.Width(hint)
+	// Reserve space: "  " prefix (2) + changeInfo + "  " gap (2) + hint
+	changeWidth := lipgloss.Width(changeInfo)
+	maxNameWidth := m.width - 2 - changeWidth - 2 - hintWidth
+	if maxNameWidth < 10 {
+		maxNameWidth = 10
+	}
+	if len(basename) > maxNameWidth {
+		basename = basename[:maxNameWidth-1] + "…"
+	}
+	header := "  " + cyanStyle.Render(basename) + changeInfo
 	return padLine(header, hint, m.width) + "\n"
 }
 
@@ -2360,7 +2775,7 @@ func (m Model) renderFooter() string {
 		rightHint := keyStyle.Render("q") + dimStyle.Render(" quit  ")
 		return padLine(leftHint, rightHint, m.width)
 	}
-	leftHint := keyStyle.Render("  c") + dimStyle.Render(" copy  ") + keyStyle.Render("p") + dimStyle.Render(" path  ")
+	leftHint := keyStyle.Render("  c") + dimStyle.Render(" copy  ") + keyStyle.Render("p") + dimStyle.Render(" path  ") + keyStyle.Render("o") + dimStyle.Render(" open  ")
 	rightHint := keyStyle.Render("q") + dimStyle.Render(" quit  ")
 	return padLine(leftHint, rightHint, m.width)
 }
