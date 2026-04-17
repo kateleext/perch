@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -37,7 +38,7 @@ import (
 var DevBuild = false
 
 // Version is the current version of perch
-var Version = "0.0.4"
+var Version = "0.0.7"
 
 // ANSI codes for diff lines
 const (
@@ -492,7 +493,16 @@ func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
 
 		// Check if it's an image file
 		if isImageFile(file.Path) {
-			imgRender, msg := renderImagePreview(fullPath, viewWidth, viewHeight)
+			imgRender, msg, renderErr := safeRenderImage(func() (string, string) {
+				return renderImagePreview(fullPath, viewWidth, viewHeight)
+			})
+			if renderErr != nil {
+				return previewLoadedMsg{
+					selectedIndex: selectedIndex,
+					gen:           gen,
+					preview:       PreviewContent{Valid: true, Message: filepath.Base(file.Path) + "\nimage — could not render"},
+				}
+			}
 			return previewLoadedMsg{
 				selectedIndex: selectedIndex,
 				gen:           gen,
@@ -727,8 +737,14 @@ func (m *Model) updatePreviewKeepScroll(keepScroll bool) {
 
 	// Check if it's an image file
 	if isImageFile(file.Path) {
-		imgRender, msg := renderImagePreview(fullPath, m.width, m.viewport.Height)
-		m.preview = PreviewContent{Valid: true, ImageRender: imgRender, Message: msg}
+		imgRender, msg, renderErr := safeRenderImage(func() (string, string) {
+			return renderImagePreview(fullPath, m.width, m.viewport.Height)
+		})
+		if renderErr != nil {
+			m.preview = PreviewContent{Valid: true, Message: filepath.Base(file.Path) + "\nimage — could not render"}
+		} else {
+			m.preview = PreviewContent{Valid: true, ImageRender: imgRender, Message: msg}
+		}
 		m.viewport.SetContent(m.renderPreviewContent())
 		if !keepScroll {
 			m.viewport.GotoTop()
@@ -922,7 +938,12 @@ func (m *Model) updatePreviewKeepScroll(keepScroll bool) {
 }
 
 // renderPreviewContent builds the content string for the viewport using wrapped lines
-func (m *Model) renderPreviewContent() string {
+func (m *Model) renderPreviewContent() (result string) {
+	defer func() {
+		if r := recover(); r != nil {
+			result = dimStyle.Render(fmt.Sprintf("preview render error: %v", r))
+		}
+	}()
 	if !m.preview.Valid {
 		return ""
 	}
@@ -1441,6 +1462,7 @@ func extractPdfStructured(path string) (rawLines []string, highlightedLines []st
 			highlightedLines = append(highlightedLines, ansiColor256(241, pageHeader))
 		}
 		for _, line := range strings.Split(strings.TrimRight(text, "\n\r "), "\n") {
+			line = sanitizeExtractedLine(line)
 			rawLines = append(rawLines, line)
 			highlightedLines = append(highlightedLines, ansiColor256(252, line))
 		}
@@ -1514,25 +1536,168 @@ func stripANSI(s string) string {
 	return out.String()
 }
 
-// safeExtractStructured wraps a structured extraction function with panic recovery.
+// sanitizeExtractedLine strips control characters (including ESC, CR, FF, BEL, etc.)
+// and invalid UTF-8 from a line of extracted text. PDF content streams and other
+// binary-derived text can carry raw escape sequences that, if passed through to
+// the terminal, reposition the cursor or clear the screen and wreck the TUI frame.
+func sanitizeExtractedLine(s string) string {
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "")
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\t':
+			b.WriteRune(r)
+		case r < 0x20 || r == 0x7f:
+			// Drop C0 controls and DEL — ESC, CR, LF, FF, BEL, backspace, etc.
+			continue
+		case r >= 0x80 && r < 0xa0:
+			// Drop C1 controls.
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// sanitizeHighlightedLine strips stray control characters but preserves valid
+// ANSI CSI sequences (`\x1b[...<final>`) that our highlighters emit. Any ESC
+// not followed by a well-formed CSI is dropped.
+func sanitizeHighlightedLine(s string) string {
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "")
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c == 0x1b {
+			if i+1 < len(s) && s[i+1] == '[' {
+				j := i + 2
+				for j < len(s) {
+					ch := s[j]
+					if ch >= 0x40 && ch <= 0x7e {
+						j++
+						break
+					}
+					j++
+				}
+				b.WriteString(s[i:j])
+				i = j
+				continue
+			}
+			i++
+			continue
+		}
+		if c == '\t' {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		if c < 0x20 || c == 0x7f {
+			i++
+			continue
+		}
+		if c < 0x80 {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r >= 0x80 && r < 0xa0 {
+			i += size
+			continue
+		}
+		b.WriteString(s[i : i+size])
+		i += size
+	}
+	return b.String()
+}
+
+// outputSilenceMu serializes os.Stdout/os.Stderr redirection across extractions.
+var outputSilenceMu sync.Mutex
+
+// withSilencedOutput runs fn with the os.Stdout and os.Stderr variables pointed
+// at /dev/null. bubbletea caches its own output handle at program init, so this
+// redirection only gags libraries that read os.Stdout/os.Stderr at call time —
+// notably github.com/ledongthuc/pdf, which prints warnings via fmt.Printf mid-parse
+// and would otherwise shred the TUI.
+func withSilencedOutput(fn func()) {
+	outputSilenceMu.Lock()
+	defer outputSilenceMu.Unlock()
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		fn()
+		return
+	}
+	defer devnull.Close()
+	origStdout, origStderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = devnull, devnull
+	defer func() {
+		os.Stdout, os.Stderr = origStdout, origStderr
+	}()
+	fn()
+}
+
+// safeExtractStructured wraps a structured extraction function with panic recovery
+// and stdout/stderr silencing so noisy parser libraries can't corrupt the TUI.
+// All returned lines are sanitized to strip terminal control characters that
+// binary-derived text (PDF content streams, etc.) sometimes carries.
 func safeExtractStructured(fn func() ([]string, []string)) (rawLines []string, hlLines []string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("%v", r)
 		}
 	}()
-	rawLines, hlLines = fn()
+	withSilencedOutput(func() {
+		rawLines, hlLines = fn()
+	})
+	for i, line := range rawLines {
+		rawLines[i] = sanitizeExtractedLine(line)
+	}
+	for i, line := range hlLines {
+		hlLines[i] = sanitizeHighlightedLine(line)
+	}
 	return
 }
 
-// safeExtractText wraps a text extraction function with panic recovery.
+// safeExtractText wraps a text extraction function with panic recovery and
+// stdout/stderr silencing. Each output line is sanitized of terminal control
+// characters so extracted binary-derived text can't wreck the TUI frame.
 func safeExtractText(fn func() string) (text string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("%v", r)
 		}
 	}()
-	text = fn()
+	withSilencedOutput(func() {
+		text = fn()
+	})
+	if text != "" {
+		lines := strings.Split(text, "\n")
+		for i, line := range lines {
+			lines[i] = sanitizeExtractedLine(line)
+		}
+		text = strings.Join(lines, "\n")
+	}
+	return
+}
+
+// safeRenderImage wraps image rendering with panic recovery and output silencing
+// so a malformed image can't kill the app.
+func safeRenderImage(fn func() (string, string)) (imgRender, msg string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+	withSilencedOutput(func() {
+		imgRender, msg = fn()
+	})
 	return
 }
 
