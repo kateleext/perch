@@ -59,6 +59,8 @@ Run it in a split pane next to your editor or agent.
 | `g/G` | Jump to top/bottom |
 | `c` | Copy file content |
 | `p` | Copy file path |
+| `o` | Open file |
+| `f` | Reveal in file manager (Finder on macOS) |
 | `+/-` | Resize file list |
 | `q` | Quit |
 

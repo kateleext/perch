@@ -3,17 +3,20 @@ package ui
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"image"
@@ -295,6 +298,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if cmd.Start() == nil {
 					m.flashMsg = "opened"
+					m.flashExpiry = time.Now().Add(2 * time.Second)
+					cmds = append(cmds, clearFlashAfter(2*time.Second))
+				}
+			}
+		case "f":
+			if m.selected >= 0 && m.selected < len(m.files) {
+				file := m.files[m.selected]
+				fullPath := filepath.Join(m.dir, file.Path)
+				var cmd *exec.Cmd
+				if runtime.GOOS == "darwin" {
+					cmd = exec.Command("open", "-R", fullPath)
+				} else {
+					cmd = exec.Command("xdg-open", filepath.Dir(fullPath))
+				}
+				if cmd.Start() == nil {
+					m.flashMsg = "revealed"
 					m.flashExpiry = time.Now().Add(2 * time.Second)
 					cmds = append(cmds, clearFlashAfter(2*time.Second))
 				}
@@ -1425,6 +1444,21 @@ func formatFileSize(bytes int64) string {
 // --- ZIP / Office document support ---
 
 // extractPdfStructured extracts text from a PDF, returning lines for RawLines/HighlightedLines.
+//
+// Some PDFs — notably ones produced by Chrome/Skia's "print to PDF" path —
+// use font encodings that github.com/ledongthuc/pdf decodes incorrectly. It
+// doesn't error out; it silently returns printable-looking but semantically
+// wrong text ("glyph soup"), because it maps character codes through the
+// font's built-in encoding instead of the PDF's ToUnicode/CMap table.
+//
+// To avoid ever showing that to the user, extraction prefers shelling out to
+// `pdftotext` (poppler-utils) when it's on PATH, since it correctly honors
+// ToUnicode/CMap tables. Perch ships via Homebrew and can't assume poppler
+// is installed, so if pdftotext is missing (or fails, or only covers some
+// pages) this falls back to the pure-Go library for the rest. Either way,
+// every page's text is run through a garbage-detection heuristic before
+// being shown, so a bad decode degrades to a clean "no extractable text"
+// message rather than glyph soup.
 func extractPdfStructured(path string) (rawLines []string, highlightedLines []string) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -1447,15 +1481,15 @@ func extractPdfStructured(path string) (rawLines []string, highlightedLines []st
 	rawLines = append(rawLines, header, "")
 	highlightedLines = append(highlightedLines, ansiColor256(241, header), "")
 
+	pageTexts := extractPdfPageTexts(path, reader, numPages)
+
+	anyUsable := false
 	for i := 1; i <= numPages; i++ {
-		page := reader.Page(i)
-		if page.V.IsNull() {
+		text, ok := pageTexts[i]
+		if !ok {
 			continue
 		}
-		text, err := page.GetPlainText(nil)
-		if err != nil || strings.TrimSpace(text) == "" {
-			continue
-		}
+		anyUsable = true
 		if numPages > 1 {
 			pageHeader := fmt.Sprintf("── page %d ──", i)
 			rawLines = append(rawLines, pageHeader)
@@ -1470,7 +1504,198 @@ func extractPdfStructured(path string) (rawLines []string, highlightedLines []st
 		highlightedLines = append(highlightedLines, "")
 	}
 
+	if !anyUsable {
+		msg := "PDF — no extractable text"
+		rawLines = append(rawLines, msg)
+		highlightedLines = append(highlightedLines, ansiColor256(241, msg))
+	}
+
 	return rawLines, highlightedLines
+}
+
+// extractPdfPageTexts returns the usable (non-blank, non-garbled) text for
+// each 1-indexed page. Pages that are blank or whose extracted text looks
+// garbled are simply absent from the map, and become "no extractable text"
+// to the caller rather than glyph soup.
+func extractPdfPageTexts(path string, reader *gopdf.Reader, numPages int) map[int]string {
+	result := make(map[int]string, numPages)
+
+	if pages, ok := pdftotextPages(path, numPages); ok {
+		for i := 1; i <= numPages; i++ {
+			text := pages[i]
+			if strings.TrimSpace(text) != "" && !isGarbledText(text) {
+				result[i] = text
+			}
+		}
+	}
+
+	// Fill in anything pdftotext didn't give us (not installed, failed to
+	// run, or just didn't produce usable text for a given page) using the
+	// pure-Go library.
+	for i := 1; i <= numPages; i++ {
+		if _, ok := result[i]; ok {
+			continue
+		}
+		page := reader.Page(i)
+		if page.V.IsNull() {
+			continue
+		}
+		text, err := page.GetPlainText(nil)
+		if err != nil || strings.TrimSpace(text) == "" {
+			continue
+		}
+		if isGarbledText(text) {
+			continue
+		}
+		result[i] = text
+	}
+
+	return result
+}
+
+// pdftotextPages shells out to poppler's pdftotext, if available, and
+// returns per-page text (1-indexed). ok is false if the binary isn't on
+// PATH or it failed to run, in which case callers fall back to the
+// pure-Go library.
+func pdftotextPages(path string, numPages int) (pages map[int]string, ok bool) {
+	binPath, err := exec.LookPath("pdftotext")
+	if err != nil {
+		return nil, false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// No -layout: layout mode reproduces the PDF's spatial positions (centered
+	// headers, deep column indents), which reads poorly in a narrow preview
+	// pane. Reading-order output keeps everything left-aligned.
+	cmd := exec.CommandContext(ctx, binPath, "-enc", "UTF-8", path, "-")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, false
+	}
+
+	// pdftotext separates pages with a form-feed character.
+	parts := strings.Split(string(out), "\f")
+	pages = make(map[int]string, numPages)
+	for i := 0; i < numPages && i < len(parts); i++ {
+		pages[i+1] = parts[i]
+	}
+	return pages, true
+}
+
+// commonProseWords is used by isGarbledText to sanity-check that extracted
+// text is coherent prose, not just printable characters. It intentionally
+// covers high-frequency function words from several Latin-script languages
+// (English, French, German, Spanish/Portuguese), not just English — Perch
+// previews PDFs of unknown language, and a document written in French or
+// German is not "garbled" just because it doesn't use English stop words.
+var commonProseWords = map[string]bool{
+	// English
+	"the": true, "and": true, "of": true, "to": true, "in": true, "is": true,
+	"for": true, "with": true, "you": true, "that": true, "this": true,
+	"on": true, "as": true, "are": true, "we": true, "our": true, "your": true,
+	"by": true, "it": true, "not": true, "be": true, "or": true, "at": true,
+	"from": true, "an": true, "will": true, "can": true, "all": true,
+	"was": true, "were": true, "have": true, "has": true, "a": true, "i": true,
+	"us": true, "if": true, "but": true, "so": true, "its": true, "their": true,
+	// French
+	"le": true, "la": true, "les": true, "de": true, "des": true, "du": true,
+	"un": true, "une": true, "et": true, "est": true, "sont": true,
+	"dans": true, "pour": true, "sur": true, "avec": true, "que": true,
+	"qui": true, "ne": true, "pas": true, "se": true, "ce": true, "par": true,
+	"plus": true, "ou": true, "il": true, "elle": true, "nous": true,
+	"vous": true, "ils": true, "elles": true, "au": true, "aux": true,
+	"son": true, "sa": true, "ses": true, "leur": true, "leurs": true,
+	"entre": true, "sans": true, "sous": true, "tout": true, "tous": true,
+	"comme": true, "mais": true, "donc": true, "être": true, "été": true,
+	// German
+	"der": true, "die": true, "das": true, "und": true, "ist": true,
+	"sind": true, "im": true, "für": true, "mit": true, "auf": true,
+	"von": true, "zu": true, "zum": true, "zur": true, "ein": true,
+	"eine": true, "einer": true, "eines": true, "einem": true, "einen": true,
+	"nicht": true, "sich": true, "dass": true, "als": true, "bei": true,
+	"aus": true, "wird": true, "werden": true, "wurde": true, "oder": true,
+	"auch": true, "sie": true, "er": true, "es": true, "wir": true,
+	"ihr": true, "den": true, "dem": true, "nach": true, "über": true,
+	"unter": true, "vor": true, "durch": true,
+	// Spanish / Portuguese
+	"el": true, "los": true, "las": true, "del": true, "una": true,
+	"y": true, "para": true, "por": true, "con": true,
+	"no": true, "su": true, "sus": true, "lo": true, "como": true,
+	"pero": true, "si": true, "este": true, "esta": true, "estos": true,
+	"estas": true, "também": true, "não": true, "os": true, "uma": true,
+}
+
+var wordTokenRe = regexp.MustCompile(`[\p{L}']+`)
+
+// isGarbledText decides whether extracted text is real prose or "glyph
+// soup" produced by a mis-decoded PDF font, using two cheap, independent
+// signals:
+//
+//  1. The fraction of characters outside the normal letter/digit/
+//     whitespace/punctuation set. This catches text where character codes
+//     got mapped to the wrong Unicode glyphs entirely (accented letters,
+//     symbols, private-use codepoints in place of English prose).
+//
+//  2. How often common function words ("the", "and", "of", "le", "der",
+//     ...) appear among the extracted words. This catches the case (1)
+//     can't: every character code mapped to a *different but still
+//     printable* ASCII character, producing something that looks like text
+//     but reads as nonsense — e.g. Chrome/Skia PDFs mis-decoded via a
+//     font's built-in encoding instead of its ToUnicode map. The word list
+//     spans several Latin-script languages (see commonProseWords) so that
+//     legitimate non-English prose isn't mistaken for glyph soup just for
+//     not matching English stop words.
+//
+// Either signal firing on a large-enough sample marks the text as garbled.
+// Short samples are given the benefit of the doubt to avoid false positives
+// on tables, numbers, or single-word labels.
+func isGarbledText(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+
+	var total, weird int
+	for _, r := range s {
+		total++
+		switch {
+		case r == '\n' || r == '\r' || r == '\t' || r == ' ':
+			// normal whitespace
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			// normal (includes accented/non-Latin letters, e.g. é, ü, ñ)
+		case unicode.Is(unicode.Sm, r) && r > unicode.MaxASCII:
+			// non-ASCII mathematical operators (∀ ∃ ∂ ∫ ∈ ± × ÷ √ ∞ ...);
+			// legitimate technical prose, not evidence of mis-decoding.
+			// (ASCII math symbols like < and > are left as-is below since
+			// they're also common substitution-cipher glyphs in real
+			// glyph-soup output.)
+		case strings.ContainsRune(".,;:!?'\"()-–—/&%$#@*+=_„“‚‘«»", r):
+			// common prose/table punctuation, including the curly and
+			// guillemet quote styles used in French/German typography
+		default:
+			weird++
+		}
+	}
+	if total >= 20 && float64(weird)/float64(total) > 0.08 {
+		return true
+	}
+
+	words := wordTokenRe.FindAllString(strings.ToLower(s), -1)
+	if len(words) >= 20 {
+		hits := 0
+		for _, w := range words {
+			if commonProseWords[w] {
+				hits++
+			}
+		}
+		if float64(hits)/float64(len(words)) < 0.05 {
+			return true
+		}
+	}
+
+	return false
 }
 
 func pluralS(n int) string {
@@ -2940,7 +3165,7 @@ func (m Model) renderFooter() string {
 		rightHint := keyStyle.Render("q") + dimStyle.Render(" quit  ")
 		return padLine(leftHint, rightHint, m.width)
 	}
-	leftHint := keyStyle.Render("  c") + dimStyle.Render(" copy  ") + keyStyle.Render("p") + dimStyle.Render(" path  ") + keyStyle.Render("o") + dimStyle.Render(" open  ")
+	leftHint := keyStyle.Render("  c") + dimStyle.Render(" copy  ") + keyStyle.Render("p") + dimStyle.Render(" path  ") + keyStyle.Render("o") + dimStyle.Render(" open  ") + keyStyle.Render("f") + dimStyle.Render(" reveal  ")
 	rightHint := keyStyle.Render("q") + dimStyle.Render(" quit  ")
 	return padLine(leftHint, rightHint, m.width)
 }
