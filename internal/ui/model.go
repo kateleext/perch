@@ -87,6 +87,8 @@ var (
 	lineAddGutter  = lipgloss.NewStyle().Foreground(lipgloss.Color("#5a8a5a")) // muted green, blends with bg
 	lineDelGutter  = lipgloss.NewStyle().Foreground(lipgloss.Color("#8a5a5a")) // muted red, blends with bg
 	lineDotStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))     // very subtle dots
+	boxFixGutter   = lipgloss.NewStyle().Foreground(lipgloss.Color("#5a7a8a")) // muted blue, box row realigned for display
+	boxWarnGutter  = lipgloss.NewStyle().Foreground(lipgloss.Color("#8a7a5a")) // muted amber, box row we can't realign
 	sparkleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("255"))     // white sparkle
 )
 
@@ -117,6 +119,7 @@ type PreviewContent struct {
 	HighlightedLines []string
 	DiffLines        map[int]string
 	DiffStats        git.DiffStats
+	BoxNotes         map[int]BoxNote // box-diagram rows padded or flagged for display
 	WrappedByWidth   map[int][]VisualLine
 }
 
@@ -133,7 +136,7 @@ func (pc *PreviewContent) WrappedLinesForWidth(width int) []VisualLine {
 	if lines, ok := pc.WrappedByWidth[width]; ok {
 		return lines
 	}
-	lines := wrapAllLines(pc.HighlightedLines, pc.RawLines, pc.DiffLines, width)
+	lines := wrapAllLines(pc.HighlightedLines, pc.RawLines, pc.DiffLines, pc.BoxNotes, width)
 	pc.WrappedByWidth[width] = lines
 	return lines
 }
@@ -684,11 +687,12 @@ func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
 		}
 
 		var highlightedLines []string
+		var boxNotes map[int]BoxNote
 		if isMarkdownERBFile(file.Path) {
-			highlightedLines = highlightMarkdownLines(rawLines, file.Path)
+			highlightedLines, boxNotes = highlightMarkdownLines(rawLines, file.Path)
 			highlightedLines = applyERBStyling(highlightedLines)
 		} else if isMarkdownFile(file.Path) {
-			highlightedLines = highlightMarkdownLines(rawLines, file.Path)
+			highlightedLines, boxNotes = highlightMarkdownLines(rawLines, file.Path)
 		} else if isERBFile(file.Path) {
 			highlightedLines = highlightCode(string(content), file.Path)
 			highlightedLines = applyERBStyling(highlightedLines)
@@ -705,6 +709,7 @@ func (m *Model) loadPreviewAsync(selectedIndex int) tea.Cmd {
 				HighlightedLines: highlightedLines,
 				DiffLines:        diffLines,
 				DiffStats:        diffStats,
+				BoxNotes:         boxNotes,
 			},
 		}
 	}
@@ -929,11 +934,12 @@ func (m *Model) updatePreviewKeepScroll(keepScroll bool) {
 	}
 
 	var highlightedLines []string
+	var boxNotes map[int]BoxNote
 	if isMarkdownERBFile(file.Path) {
-		highlightedLines = highlightMarkdownLines(rawLines, file.Path)
+		highlightedLines, boxNotes = highlightMarkdownLines(rawLines, file.Path)
 		highlightedLines = applyERBStyling(highlightedLines)
 	} else if isMarkdownFile(file.Path) {
-		highlightedLines = highlightMarkdownLines(rawLines, file.Path)
+		highlightedLines, boxNotes = highlightMarkdownLines(rawLines, file.Path)
 	} else if isERBFile(file.Path) {
 		highlightedLines = highlightCode(string(content), file.Path)
 		highlightedLines = applyERBStyling(highlightedLines)
@@ -947,6 +953,7 @@ func (m *Model) updatePreviewKeepScroll(keepScroll bool) {
 		HighlightedLines: highlightedLines,
 		DiffLines:        diffLines,
 		DiffStats:        diffStats,
+		BoxNotes:         boxNotes,
 	}
 
 	m.viewport.SetContent(m.renderPreviewContent())
@@ -1021,7 +1028,14 @@ func (m *Model) renderPreviewContent() (result string) {
 			bgCode = bgDelANSI
 			fgCode = fgDelANSI
 		default:
-			gutter = "  " + lineDotStyle.Render(vl.Gutter)
+			switch vl.BoxNote {
+			case BoxNoteAdjusted:
+				gutter = "  " + boxFixGutter.Render(vl.Gutter)
+			case BoxNoteMisaligned:
+				gutter = "  " + boxWarnGutter.Render(vl.Gutter)
+			default:
+				gutter = "  " + lineDotStyle.Render(vl.Gutter)
+			}
 		}
 
 		// Apply horizontal scroll to wide lines (e.g. unwrapped table lines)

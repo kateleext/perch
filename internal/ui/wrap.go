@@ -8,11 +8,12 @@ import (
 
 // VisualLine represents one physical line in the viewport
 type VisualLine struct {
-	LogicalIndex int    // index into HighlightedLines
-	SegmentIndex int    // 0 = first segment, 1+ = continuations
-	Gutter       string // "· ", "+ ", "- ", or "  " for continuations
-	Text         string // ANSI-highlighted content slice
-	DiffStatus   string // "added", "deleted", or "" for styling
+	LogicalIndex int     // index into HighlightedLines
+	SegmentIndex int     // 0 = first segment, 1+ = continuations
+	Gutter       string  // "· ", "+ ", "- ", "┆ ", or "  " for continuations
+	Text         string  // ANSI-highlighted content slice
+	DiffStatus   string  // "added", "deleted", or "" for styling
+	BoxNote      BoxNote // box-diagram row that was padded or flagged
 }
 
 const gutterWidth = 4 // "  · " or "  + " etc
@@ -193,18 +194,21 @@ func isTableLine(rawLine string) bool {
 
 // wrapHighlightedLine splits one highlighted line into VisualLine segments
 // with hanging indent support - continuation lines preserve leading whitespace
-func wrapHighlightedLine(line string, logicalIndex int, maxWidth int, diffStatus string, rawLine string) []VisualLine {
+func wrapHighlightedLine(line string, logicalIndex int, maxWidth int, diffStatus string, rawLine string, boxNote BoxNote) []VisualLine {
 	if maxWidth <= gutterWidth {
 		maxWidth = gutterWidth + 10
 	}
 
-	// Determine gutter symbol based on diff status
+	// Determine gutter symbol based on diff status, falling back to the
+	// box-alignment marker when the line is otherwise unremarkable
 	var firstGutter string
-	switch diffStatus {
-	case "added":
+	switch {
+	case diffStatus == "added":
 		firstGutter = "+ "
-	case "deleted":
+	case diffStatus == "deleted":
 		firstGutter = "- "
+	case boxNote != BoxNoteNone:
+		firstGutter = "┆ "
 	default:
 		firstGutter = "· "
 	}
@@ -217,6 +221,7 @@ func wrapHighlightedLine(line string, logicalIndex int, maxWidth int, diffStatus
 			Gutter:       firstGutter,
 			Text:         line,
 			DiffStatus:   diffStatus,
+			BoxNote:      boxNote,
 		}}
 	}
 
@@ -271,6 +276,7 @@ func wrapHighlightedLine(line string, logicalIndex int, maxWidth int, diffStatus
 			Gutter:       gutter,
 			Text:         text,
 			DiffStatus:   diffStatus,
+			BoxNote:      boxNote,
 		})
 
 		if rest == "" {
@@ -286,7 +292,7 @@ func wrapHighlightedLine(line string, logicalIndex int, maxWidth int, diffStatus
 }
 
 // wrapAllLines wraps all highlighted lines for a given width
-func wrapAllLines(highlighted []string, rawLines []string, diffLines map[int]string, maxWidth int) []VisualLine {
+func wrapAllLines(highlighted []string, rawLines []string, diffLines map[int]string, boxNotes map[int]BoxNote, maxWidth int) []VisualLine {
 	var result []VisualLine
 
 	for i, line := range highlighted {
@@ -309,7 +315,7 @@ func wrapAllLines(highlighted []string, rawLines []string, diffLines map[int]str
 			displayLine = rawLine
 		}
 
-		wrapped := wrapHighlightedLine(displayLine, i, maxWidth, diffStatus, rawLine)
+		wrapped := wrapHighlightedLine(displayLine, i, maxWidth, diffStatus, rawLine, boxNotes[i])
 		result = append(result, wrapped...)
 	}
 

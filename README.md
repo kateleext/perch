@@ -30,16 +30,16 @@ go install github.com/kateleext/perch/cmd/perch@latest
 **Direct download:**
 ```
 # macOS arm64 (Apple Silicon)
-curl -L https://github.com/kateleext/perch/releases/download/v0.0.5/perch_darwin_arm64.tar.gz | tar xz -C /usr/local/bin
+curl -L https://github.com/kateleext/perch/releases/download/v0.0.9/perch_darwin_arm64.tar.gz | tar xz -C /usr/local/bin
 
 # macOS x86_64 (Intel)
-curl -L https://github.com/kateleext/perch/releases/download/v0.0.5/perch_darwin_amd64.tar.gz | tar xz -C /usr/local/bin
+curl -L https://github.com/kateleext/perch/releases/download/v0.0.9/perch_darwin_amd64.tar.gz | tar xz -C /usr/local/bin
 
 # Linux arm64
-curl -L https://github.com/kateleext/perch/releases/download/v0.0.5/perch_linux_arm64.tar.gz | tar xz -C /usr/local/bin
+curl -L https://github.com/kateleext/perch/releases/download/v0.0.9/perch_linux_arm64.tar.gz | tar xz -C /usr/local/bin
 
 # Linux x86_64
-curl -L https://github.com/kateleext/perch/releases/download/v0.0.5/perch_linux_amd64.tar.gz | tar xz -C /usr/local/bin
+curl -L https://github.com/kateleext/perch/releases/download/v0.0.9/perch_linux_amd64.tar.gz | tar xz -C /usr/local/bin
 ```
 
 ## Usage
@@ -67,6 +67,8 @@ Run it in a split pane next to your editor or agent.
 ## File support
 
 **Full preview:** Any text file with syntax highlighting (100+ languages), Markdown with styled headings/tables/code blocks
+
+**Box diagrams:** ASCII/Unicode box diagrams in fenced code blocks are checked against their own borders and realigned for display when a row misses the right edge. Corrected rows get a blue `┆` in the gutter; rows whose content overruns the border — which whitespace can't fix — get an amber `┆`. The file on disk is never touched, so copy and diff still show exactly what's there.
 
 **Office docs:** Word (.docx) with heading hierarchy, PowerPoint (.pptx) with slide dividers, Excel (.xlsx) as rainbow-colored tables, OpenDocument formats
 

@@ -37,10 +37,17 @@ type mdRenderer struct {
 	// Table buffering for proper column alignment
 	tableBuffer [][]string // buffered rows (each row is slice of cells)
 	tableStart  int        // line index where table started
+	// Display-only column adjustments for box-diagram rows, keyed by line index
+	boxAdjust map[int]int
 }
 
-func highlightMarkdownLines(lines []string, filename string) []string {
-	r := &mdRenderer{}
+// highlightMarkdownLines styles a markdown file for display. It also returns a
+// note per line for any box-diagram row whose right edge did not line up — see
+// boxfix.go. Adjusted rows are corrected in the returned lines only; the
+// caller's input is left untouched.
+func highlightMarkdownLines(lines []string, filename string) ([]string, map[int]BoxNote) {
+	boxAdjust, boxNotes := computeBoxFixes(lines)
+	r := &mdRenderer{boxAdjust: boxAdjust}
 	result := make([]string, len(lines))
 	for i, line := range lines {
 		rendered, flush := r.renderLine(line, i)
@@ -69,7 +76,7 @@ func highlightMarkdownLines(lines []string, filename string) []string {
 			}
 		}
 	}
-	return result
+	return result, boxNotes
 }
 
 func (r *mdRenderer) renderLine(line string, lineIdx int) (rendered string, flushTable bool) {
@@ -80,7 +87,9 @@ func (r *mdRenderer) renderLine(line string, lineIdx int) (rendered string, flus
 			r.inCodeBlock = false
 			return "", false
 		}
-		return highlightCodeFenceLine(line, r.codeLang), false
+		// Adjust before highlighting so the moved spaces sit inside the same
+		// token stream as the rest of the row.
+		return highlightCodeFenceLine(applyBoxAdjust(line, r.boxAdjust[lineIdx]), r.codeLang), false
 	}
 
 	if matches := fenceRegex.FindStringSubmatch(line); matches != nil {
